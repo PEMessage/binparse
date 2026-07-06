@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""TLV heuristic parser — xxd-style output with ANSI color highlighting.
+
+Reads a byte stream from stdin, finds all valid TLV structures, and renders
+them with colored backgrounds in xxd format.
+
+TLV format:
+    TAG (2B): B0 in [0x00, 0x10], B1 in {'I','O'}
+    LEN (2B): little-endian value length
+    VALUE (nB)
+"""
+
+import sys
+import argparse
+from dataclasses import dataclass
+
+_RESET = "\033[0m"
+_TAG = "\033[41;37m"   # dark red bg, white fg
+_LEN = "\033[43;30m"   # dark yellow bg, black fg
+_VAL = "\033[44;37m"   # dark blue bg, white fg
+
+
+@dataclass
+class TLV:
+    start: int
+    tag_end: int
+    len_end: int
+    value_end: int
+
+
+def parse(data: bytes, mode: str = "overlap") -> list[TLV]:
+    total = len(data)
+    result: list[TLV] = []
+    i = 0
+    while i < max(0, total - 1):
+        b0, b1 = data[i], data[i + 1]
+        if 0x00 <= b0 <= 0x10 and b1 in (0x49, 0x4F):
+            if i + 4 <= total:
+                length = data[i + 2] | (data[i + 3] << 8)
+                if i + 4 + length <= total:
+                    result.append(TLV(i, i + 2, i + 4, i + 4 + length))
+                    if mode == "exclude":
+                        i = i + 4 + length
+                        continue
+        i += 1
+    return result
+
+
+def build_color_map(tlvs: list[TLV], total: int) -> dict[int, str]:
+    cmap: dict[int, str] = {}
+    for t in tlvs:
+        for p in range(t.start, t.tag_end):
+            cmap[p] = _TAG
+        for p in range(t.tag_end, t.len_end):
+            cmap[p] = _LEN
+        for p in range(t.len_end, t.value_end):
+            cmap[p] = _VAL
+    return cmap
+
+
+def render_xxd(data: bytes, cmap: dict[int, str]) -> str:
+    lines: list[str] = []
+    total = len(data)
+
+    for offset in range(0, total, 16):
+        chunk = data[offset:offset + 16]
+        n = len(chunk)
+
+        hex_items = []
+        for j in range(16):
+            if j < n:
+                b = chunk[j]
+                c = cmap.get(offset + j, "")
+                h = f"{b:02x}"
+                hex_items.append(f"{c}{h}{_RESET}" if c else h)
+            else:
+                hex_items.append("  ")
+
+        left = " ".join(hex_items[:8])
+        right = " ".join(hex_items[8:])
+        hex_line = f"{left}  {right}"
+
+        ascii_chars = []
+        for j in range(16):
+            if j < n:
+                b = chunk[j]
+                c = cmap.get(offset + j, "")
+                ch = chr(b) if 0x20 <= b <= 0x7E else "."
+                ascii_chars.append(f"{c}{ch}{_RESET}" if c else ch)
+            else:
+                ascii_chars.append(" ")
+
+        lines.append(f"{offset:08x}: {hex_line}  {''.join(ascii_chars)}")
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="TLV heuristic parser — xxd-style output with ANSI colors"
+    )
+    parser.add_argument("-m", "--mode", choices=["overlap", "exclude"],
+                        default="overlap",
+                        help="parse mode: overlap (default) or exclude")
+    args = parser.parse_args()
+
+    data = sys.stdin.buffer.read()
+    if not data:
+        return
+
+    tlvs = parse(data, mode=args.mode)
+    cmap = build_color_map(tlvs, len(data))
+    print(render_xxd(data, cmap))
+
+
+if __name__ == "__main__":
+    main()
