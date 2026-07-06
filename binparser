@@ -11,13 +11,132 @@ TLV format:
 """
 
 import sys
+import os
+import re
 import argparse
+import termios
+import select
 from dataclasses import dataclass
 
 _RESET = "\033[0m"
-_TAG = "\033[41;37m"   # dark red bg, white fg
-_LEN = "\033[43;30m"   # dark yellow bg, black fg
-_VAL = "\033[44;37m"   # dark blue bg, white fg
+
+# _BaseRed = (246, 88, 102)
+# _BaseYel = (239, 189, 93)
+# _BaseBlu = (65, 156, 255)
+_BaseRed = (255, 0, 0)
+_BaseYel = (255, 255, 0)
+_BaseBlu = (0, 0, 255)
+_Alpha = 0.2
+_DefaultBG = (255, 255, 255)
+
+_CACHED_BG: tuple[int, int, int] | None = None
+_CACHED_TAG: str = ""
+_CACHED_LEN: str = ""
+_CACHED_VAL: str = ""
+
+
+def _bg_color() -> tuple[int, int, int]:
+    global _CACHED_BG
+    if _CACHED_BG is not None:
+        return _CACHED_BG
+    _CACHED_BG = _query_bg() or _DefaultBG
+    return _CACHED_BG
+
+
+def _query_bg() -> tuple[int, int, int] | None:
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        old = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] &= ~(termios.ICANON | termios.ECHO)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 3
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        os.write(fd, b"\x1b]11;?\x1b\\")
+        buf = b""
+        while True:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if not r:
+                break
+            try:
+                ch = os.read(fd, 1)
+            except OSError:
+                break
+            if not ch:
+                break
+            buf += ch
+            if buf.endswith(b"\x1b\\") or buf.endswith(b"\x07"):
+                break
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        os.close(fd)
+        return _parse_osc11(buf)
+    except Exception:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+        except Exception:
+            pass
+        os.close(fd)
+        return None
+
+
+def _parse_osc11(data: bytes) -> tuple[int, int, int] | None:
+    text = data.decode(errors="replace")
+    m = re.search(r"rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})", text)
+    if m:
+        return (
+            int(m.group(1), 16) >> (max(len(m.group(1)) - 2, 0) * 4),
+            int(m.group(2), 16) >> (max(len(m.group(2)) - 2, 0) * 4),
+            int(m.group(3), 16) >> (max(len(m.group(3)) - 2, 0) * 4),
+        )
+    m = re.search(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})", text)
+    if m:
+        return int(m.group(1), 16), int(m.group(2), 16), int(m.group(3), 16)
+    return None
+
+
+def _blend(fg_rgb: tuple[int, int, int], bg_rgb: tuple[int, int, int],
+           alpha: float = _Alpha) -> tuple[int, int, int]:
+    return (
+        int(alpha * fg_rgb[0] + (1 - alpha) * bg_rgb[0]),
+        int(alpha * fg_rgb[1] + (1 - alpha) * bg_rgb[1]),
+        int(alpha * fg_rgb[2] + (1 - alpha) * bg_rgb[2]),
+    )
+
+
+def _truecolor(r: int, g: int, b: int) -> str:
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    fg = "30" if lum > 128 else "37"
+    return f"\033[48;2;{r};{g};{b};{fg}m"
+
+
+def _make_color(base: tuple[int, int, int]) -> str:
+    bg = _bg_color()
+    r, g, b = _blend(base, bg)
+    return _truecolor(r, g, b)
+
+
+def _TAG() -> str:
+    global _CACHED_TAG
+    if not _CACHED_TAG:
+        _CACHED_TAG = _make_color(_BaseRed)
+    return _CACHED_TAG
+
+
+def _LEN() -> str:
+    global _CACHED_LEN
+    if not _CACHED_LEN:
+        _CACHED_LEN = _make_color(_BaseYel)
+    return _CACHED_LEN
+
+
+def _VAL() -> str:
+    global _CACHED_VAL
+    if not _CACHED_VAL:
+        _CACHED_VAL = _make_color(_BaseBlu)
+    return _CACHED_VAL
 
 
 @dataclass
@@ -50,11 +169,11 @@ def build_color_map(tlvs: list[TLV], total: int) -> dict[int, str]:
     cmap: dict[int, str] = {}
     for t in tlvs:
         for p in range(t.start, t.tag_end):
-            cmap[p] = _TAG
+            cmap[p] = _TAG()
         for p in range(t.tag_end, t.len_end):
-            cmap[p] = _LEN
+            cmap[p] = _LEN()
         for p in range(t.len_end, t.value_end):
-            cmap[p] = _VAL
+            cmap[p] = _VAL()
     return cmap
 
 
