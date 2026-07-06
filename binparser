@@ -30,9 +30,9 @@ _Alpha = 0.2
 _DefaultBG = (255, 255, 255)
 
 _CACHED_BG: tuple[int, int, int] | None = None
-_CACHED_TAG: str = ""
-_CACHED_LEN: str = ""
-_CACHED_VAL: str = ""
+_CACHED_TAG_BG: tuple[int, int, int] | None = None
+_CACHED_LEN_BG: tuple[int, int, int] | None = None
+_CACHED_VAL_BG: tuple[int, int, int] | None = None
 
 
 def _bg_color() -> tuple[int, int, int]:
@@ -106,37 +106,48 @@ def _blend(fg_rgb: tuple[int, int, int], bg_rgb: tuple[int, int, int],
     )
 
 
-def _truecolor(r: int, g: int, b: int) -> str:
-    lum = 0.299 * r + 0.587 * g + 0.114 * b
-    fg = "30" if lum > 128 else "37"
-    return f"\033[48;2;{r};{g};{b};{fg}m"
+def _tag_bg() -> tuple[int, int, int]:
+    global _CACHED_TAG_BG
+    if _CACHED_TAG_BG is None:
+        _CACHED_TAG_BG = _blend(_BaseRed, _bg_color())
+    return _CACHED_TAG_BG
 
 
-def _make_color(base: tuple[int, int, int]) -> str:
-    bg = _bg_color()
-    r, g, b = _blend(base, bg)
-    return _truecolor(r, g, b)
+def _len_bg() -> tuple[int, int, int]:
+    global _CACHED_LEN_BG
+    if _CACHED_LEN_BG is None:
+        _CACHED_LEN_BG = _blend(_BaseYel, _bg_color())
+    return _CACHED_LEN_BG
 
 
-def _TAG() -> str:
-    global _CACHED_TAG
-    if not _CACHED_TAG:
-        _CACHED_TAG = _make_color(_BaseRed)
-    return _CACHED_TAG
+def _val_bg() -> tuple[int, int, int]:
+    global _CACHED_VAL_BG
+    if _CACHED_VAL_BG is None:
+        _CACHED_VAL_BG = _blend(_BaseBlu, _bg_color())
+    return _CACHED_VAL_BG
 
 
-def _LEN() -> str:
-    global _CACHED_LEN
-    if not _CACHED_LEN:
-        _CACHED_LEN = _make_color(_BaseYel)
-    return _CACHED_LEN
+def _char_rgb(b: int) -> tuple[int, int, int]:
+    if 32 <= b <= 126:
+        return (0, 140, 40)
+    if b in (9, 10, 13):
+        return (160, 130, 0)
+    if b == 0:
+        return (128, 128, 128)
+    if b == 255:
+        return (40, 80, 210)
+    return (200, 30, 30)
 
 
-def _VAL() -> str:
-    global _CACHED_VAL
-    if not _CACHED_VAL:
-        _CACHED_VAL = _make_color(_BaseBlu)
-    return _CACHED_VAL
+def _byte_ansi(offset: int, b: int,
+               cmap: dict[int, tuple[int, int, int]]) -> str:
+    bg_rgb = cmap.get(offset)
+    fg_r = _char_rgb(b)
+    fr, fg, fb = fg_r
+    if bg_rgb is not None:
+        br, bg_bl, bb = bg_rgb
+        return f"\033[0m\033[48;2;{br};{bg_bl};{bb}m\033[38;2;{fr};{fg};{fb}m"
+    return f"\033[0m\033[49m\033[38;2;{fr};{fg};{fb}m"
 
 
 @dataclass
@@ -165,19 +176,19 @@ def parse(data: bytes, mode: str = "overlap") -> list[TLV]:
     return result
 
 
-def build_color_map(tlvs: list[TLV], total: int) -> dict[int, str]:
-    cmap: dict[int, str] = {}
+def build_color_map(tlvs: list[TLV], total: int) -> dict[int, tuple[int, int, int]]:
+    cmap: dict[int, tuple[int, int, int]] = {}
     for t in tlvs:
         for p in range(t.start, t.tag_end):
-            cmap[p] = _TAG()
+            cmap[p] = _tag_bg()
         for p in range(t.tag_end, t.len_end):
-            cmap[p] = _LEN()
+            cmap[p] = _len_bg()
         for p in range(t.len_end, t.value_end):
-            cmap[p] = _VAL()
+            cmap[p] = _val_bg()
     return cmap
 
 
-def render_xxd(data: bytes, cmap: dict[int, str]) -> str:
+def render_xxd(data: bytes, cmap: dict[int, tuple[int, int, int]]) -> str:
     lines: list[str] = []
     total = len(data)
 
@@ -189,9 +200,9 @@ def render_xxd(data: bytes, cmap: dict[int, str]) -> str:
         for j in range(16):
             if j < n:
                 b = chunk[j]
-                c = cmap.get(offset + j, "")
+                c = _byte_ansi(offset + j, b, cmap)
                 h = f"{b:02x}"
-                hex_items.append(f"{c}{h}{_RESET}" if c else h)
+                hex_items.append(f"{c}{h}")
             else:
                 hex_items.append("  ")
 
@@ -203,13 +214,13 @@ def render_xxd(data: bytes, cmap: dict[int, str]) -> str:
         for j in range(16):
             if j < n:
                 b = chunk[j]
-                c = cmap.get(offset + j, "")
+                c = _byte_ansi(offset + j, b, cmap)
                 ch = chr(b) if 0x20 <= b <= 0x7E else "."
-                ascii_chars.append(f"{c}{ch}{_RESET}" if c else ch)
+                ascii_chars.append(f"{c}{ch}")
             else:
                 ascii_chars.append(" ")
 
-        lines.append(f"{offset:08x}: {hex_line}  {''.join(ascii_chars)}")
+        lines.append(f"{offset:08x}: {hex_line}{_RESET}  {''.join(ascii_chars)}{_RESET}")
 
     return "\n".join(lines)
 
