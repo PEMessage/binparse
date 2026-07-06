@@ -315,6 +315,24 @@ def _is_tag(b0: int, b1: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+#  TLV summary
+# ---------------------------------------------------------------------------
+
+def tlv_info(tlvs: list[TLV], data: bytes) -> str:
+    """Return a human-readable summary of each parsed TLV."""
+    if not tlvs:
+        return ""
+    lines: list[str] = []
+    for i, tlv in enumerate(tlvs):
+        b0 = data[tlv.offset]
+        b1 = data[tlv.offset + 1]
+        length = data[tlv.tag_end] | (data[tlv.tag_end + 1] << 8)
+        tag_str = f"{b0},{chr(b1)!r}"
+        lines.append(f"{i}:  offset={tlv.offset:#06x}  TAG: {tag_str}  LEN: {length}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 #  Render palette — bundles all colour decisions for one render pass
 # ---------------------------------------------------------------------------
 
@@ -415,6 +433,12 @@ def main() -> None:
         default=ColorMode.ALL.value,
         help="Colouring: all (default), fg (foreground only), bg (background only), none",
     )
+    ap.add_argument(
+        "--show-info",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print TLV summary after the hex dump (default: true)",
+    )
     args = ap.parse_args()
 
     data = sys.stdin.buffer.read()
@@ -438,6 +462,10 @@ def main() -> None:
         )
 
     print(render_xxd(data, tlvs, palette))
+    if args.show_info:
+        info = tlv_info(tlvs, data)
+        if info:
+            print(info)
 
 
 if __name__ == "__main__":
