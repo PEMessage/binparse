@@ -10,91 +10,132 @@ TLV format:
     VALUE (nB)
 """
 
-import sys
+from __future__ import annotations
+
+import argparse
 import os
 import re
-import argparse
-import termios
 import select
+import sys
+import termios
 from dataclasses import dataclass
+from functools import cache
+from typing import Literal
 
-_RESET = "\033[0m"
+RESET = "\033[0m"
 
-# _BaseRed = (246, 88, 102)
-# _BaseYel = (239, 189, 93)
-# _BaseBlu = (65, 156, 255)
-_BaseRed = (255, 0, 0)
-_BaseYel = (255, 255, 0)
-_BaseBlu = (0, 0, 255)
-_Alpha = 0.2
-_DefaultBG = (255, 255, 255)
+RED   = (255, 0, 0)
+YELLOW = (255, 255, 0)
+BLUE  = (0, 0, 255)
+DEFAULT_BG = (255, 255, 255)
+BLEND_ALPHA = 0.2
 
-# Color = ("true", R, G, B) | ("ansi", N) | None
-#   "true"  — truecolor RGB
-#   "ansi"  — traditional ANSI/256 palette index
-#   None    — default terminal color
+BYTES_PER_LINE = 16
+HALF_LINE = BYTES_PER_LINE // 2
 
-_CACHED_BG: tuple[int, int, int] | None = None
-_CACHED_TAG_BG: tuple | None = None
-_CACHED_LEN_BG: tuple | None = None
-_CACHED_VAL_BG: tuple | None = None
+TAG_B0_HI = 0x10
+TAG_B1_SET = {0x49, 0x4F}  # 'I', 'O'
 
+# ---------------------------------------------------------------------------
+#  Color types — tagged unions for safe, readable colour handling
+# ---------------------------------------------------------------------------
 
-def _bg_color() -> tuple[int, int, int]:
-    global _CACHED_BG
-    if _CACHED_BG is not None:
-        return _CACHED_BG
-    _CACHED_BG = _query_bg() or _DefaultBG
-    return _CACHED_BG
+@dataclass(frozen=True)
+class TrueColor:
+    """24-bit RGB background / foreground."""
+    r: int
+    g: int
+    b: int
 
 
-def _query_bg() -> tuple[int, int, int] | None:
+@dataclass(frozen=True)
+class AnsiColor:
+    """Traditional ANSI palette / 256-color index."""
+    code: int
+
+
+Color = TrueColor | AnsiColor | None
+"""The three possible colour states: truecolour, ANSI index, or terminal default."""
+
+# ---------------------------------------------------------------------------
+#  Terminal background detection
+# ---------------------------------------------------------------------------
+
+@cache
+def detect_terminal_background() -> tuple[int, int, int]:
+    """Query the terminal's background colour via OSC 11; fall back to white."""
+    rgb = _query_osc_11()
+    return rgb if rgb is not None else DEFAULT_BG
+
+
+def _query_osc_11() -> tuple[int, int, int] | None:
     try:
         fd = os.open("/dev/tty", os.O_RDWR)
     except OSError:
         return None
+
     try:
         old = termios.tcgetattr(fd)
-        new = termios.tcgetattr(fd)
-        new[3] &= ~(termios.ICANON | termios.ECHO)
-        new[6][termios.VMIN] = 1
-        new[6][termios.VTIME] = 3
-        termios.tcsetattr(fd, termios.TCSANOW, new)
+        _set_raw_mode(fd)
         os.write(fd, b"\x1b]11;?\x1b\\")
-        buf = b""
-        while True:
-            r, _, _ = select.select([fd], [], [], 0.3)
-            if not r:
-                break
-            try:
-                ch = os.read(fd, 1)
-            except OSError:
-                break
-            if not ch:
-                break
-            buf += ch
-            if buf.endswith(b"\x1b\\") or buf.endswith(b"\x07"):
-                break
-        termios.tcsetattr(fd, termios.TCSANOW, old)
-        os.close(fd)
-        return _parse_osc11(buf)
+        response = _read_osc_response(fd)
     except Exception:
-        try:
-            termios.tcsetattr(fd, termios.TCSANOW, old)
-        except Exception:
-            pass
+        response = None
+    finally:
+        _restore_terminal(fd, old)
         os.close(fd)
+
+    if response is None:
         return None
+    return _parse_osc11_response(response)
 
 
-def _parse_osc11(data: bytes) -> tuple[int, int, int] | None:
+def _set_raw_mode(fd: int) -> None:
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 3
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+
+
+def _restore_terminal(fd: int, old: list) -> None:
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+    except (NameError, Exception):
+        pass
+
+
+def _read_osc_response(fd: int) -> bytes:
+    buf = b""
+    while True:
+        r, _, _ = select.select([fd], [], [], 0.3)
+        if not r:
+            break
+        try:
+            ch = os.read(fd, 1)
+        except OSError:
+            break
+        if not ch:
+            break
+        buf += ch
+        if buf.endswith(b"\x1b\\") or buf.endswith(b"\x07"):
+            break
+    return buf
+
+
+def _parse_osc11_response(data: bytes) -> tuple[int, int, int] | None:
     text = data.decode(errors="replace")
-    m = re.search(r"rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})", text)
+    m = re.search(
+        r"rgb:([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})/([0-9a-fA-F]{1,4})", text
+    )
     if m:
+        shift_r = max(len(m.group(1)) - 2, 0) * 4
+        shift_g = max(len(m.group(2)) - 2, 0) * 4
+        shift_b = max(len(m.group(3)) - 2, 0) * 4
         return (
-            int(m.group(1), 16) >> (max(len(m.group(1)) - 2, 0) * 4),
-            int(m.group(2), 16) >> (max(len(m.group(2)) - 2, 0) * 4),
-            int(m.group(3), 16) >> (max(len(m.group(3)) - 2, 0) * 4),
+            int(m.group(1), 16) >> shift_r,
+            int(m.group(2), 16) >> shift_g,
+            int(m.group(3), 16) >> shift_b,
         )
     m = re.search(r"#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})", text)
     if m:
@@ -102,165 +143,240 @@ def _parse_osc11(data: bytes) -> tuple[int, int, int] | None:
     return None
 
 
-def _blend(fg_rgb: tuple[int, int, int], bg_rgb: tuple[int, int, int],
-           alpha: float = _Alpha) -> tuple[int, int, int]:
+# ---------------------------------------------------------------------------
+#  Colour blending & scheme
+# ---------------------------------------------------------------------------
+
+RGB = tuple[int, int, int]
+
+
+def blend(fg: RGB, bg: RGB, alpha: float = BLEND_ALPHA) -> RGB:
+    """Alpha-blend a foreground RGB over a background RGB."""
     return (
-        int(alpha * fg_rgb[0] + (1 - alpha) * bg_rgb[0]),
-        int(alpha * fg_rgb[1] + (1 - alpha) * bg_rgb[1]),
-        int(alpha * fg_rgb[2] + (1 - alpha) * bg_rgb[2]),
+        round(alpha * fg[0] + (1 - alpha) * bg[0]),
+        round(alpha * fg[1] + (1 - alpha) * bg[1]),
+        round(alpha * fg[2] + (1 - alpha) * bg[2]),
     )
 
 
-def _tag_bg() -> tuple:
-    global _CACHED_TAG_BG
-    if _CACHED_TAG_BG is None:
-        _CACHED_TAG_BG = ("true",) + _blend(_BaseRed, _bg_color())
-    return _CACHED_TAG_BG
+@dataclass(frozen=True)
+class ColorScheme:
+    """Pre-computed blended colours for the three TLV fields."""
+
+    tag:    TrueColor
+    length: TrueColor
+    value:  TrueColor
+
+    @classmethod
+    def from_background(cls, bg: RGB | None = None) -> ColorScheme:
+        if bg is None:
+            bg = detect_terminal_background()
+        return cls(
+            tag=TrueColor(*blend(RED, bg)),
+            length=TrueColor(*blend(YELLOW, bg)),
+            value=TrueColor(*blend(BLUE, bg)),
+        )
 
 
-def _len_bg() -> tuple:
-    global _CACHED_LEN_BG
-    if _CACHED_LEN_BG is None:
-        _CACHED_LEN_BG = ("true",) + _blend(_BaseYel, _bg_color())
-    return _CACHED_LEN_BG
+# ---------------------------------------------------------------------------
+#  Character display colour
+# ---------------------------------------------------------------------------
+
+def char_color(byte: int) -> AnsiColor:
+    """ANSI colour for the visual representation of a single byte."""
+    if 32 <= byte <= 126:
+        return AnsiColor(32)   # green — printable ASCII
+    if byte in (9, 10, 13):
+        return AnsiColor(33)   # yellow — whitespace
+    if byte == 0:
+        return AnsiColor(37)   # white — NUL
+    if byte == 255:
+        return AnsiColor(34)   # blue — 0xFF
+    return AnsiColor(31)       # red — other control chars
 
 
-def _val_bg() -> tuple:
-    global _CACHED_VAL_BG
-    if _CACHED_VAL_BG is None:
-        _CACHED_VAL_BG = ("true",) + _blend(_BaseBlu, _bg_color())
-    return _CACHED_VAL_BG
+# ---------------------------------------------------------------------------
+#  ANSI escape generators
+# ---------------------------------------------------------------------------
+
+def bg_escape(c: Color) -> str:
+    match c:
+        case None:
+            return "\033[49m"
+        case TrueColor(r=r, g=g, b=b):
+            return f"\033[48;2;{r};{g};{b}m"
+        case AnsiColor(code=code):
+            return f"\033[{code + 10}m"
+        case _:
+            return "\033[49m"
 
 
-def _char_color(b: int) -> tuple:
-    if 32 <= b <= 126:
-        return ("ansi", 32)
-    if b in (9, 10, 13):
-        return ("ansi", 33)
-    if b == 0:
-        return ("ansi", 37)
-    if b == 255:
-        return ("ansi", 34)
-    return ("ansi", 31)
+def fg_escape(c: Color) -> str:
+    match c:
+        case None:
+            return "\033[39m"
+        case TrueColor(r=r, g=g, b=b):
+            return f"\033[38;2;{r};{g};{b}m"
+        case AnsiColor(code=code):
+            return f"\033[{code}m"
+        case _:
+            return "\033[39m"
 
 
-def _bg_ansi(c: tuple | None) -> str:
-    if c is None:
-        return "\033[49m"
-    kind = c[0]
-    if kind == "true":
-        _, r, g, b = c
-        return f"\033[48;2;{r};{g};{b}m"
-    _, code = c
-    return f"\033[{code + 10}m"
+# ---------------------------------------------------------------------------
+#  TLV model
+# ---------------------------------------------------------------------------
 
-
-def _fg_ansi(c: tuple) -> str:
-    kind = c[0]
-    if kind == "true":
-        _, r, g, b = c
-        return f"\033[38;2;{r};{g};{b}m"
-    _, code = c
-    return f"\033[{code}m"
-
-
-def _byte_ansi(offset: int, b: int,
-               cmap: dict[int, tuple]) -> str:
-    bg = cmap.get(offset)
-    fg = _char_color(b)
-    return f"\033[0m{_bg_ansi(bg)}{_fg_ansi(fg)}"
-
-
-@dataclass
+@dataclass(frozen=True)
 class TLV:
-    start: int
-    tag_end: int
-    len_end: int
+    """A parsed TLV structure, storing byte-offset boundaries."""
+
+    offset:    int
+    tag_end:   int
+    len_end:   int
     value_end: int
 
+    def __len__(self) -> int:
+        return self.value_end - self.offset
+
+    @property
+    def tag_range(self) -> range:
+        return range(self.offset, self.tag_end)
+
+    @property
+    def length_range(self) -> range:
+        return range(self.tag_end, self.len_end)
+
+    @property
+    def value_range(self) -> range:
+        return range(self.len_end, self.value_end)
+
+
+# ---------------------------------------------------------------------------
+#  Parsing
+# ---------------------------------------------------------------------------
 
 def parse(data: bytes, mode: str = "overlap") -> list[TLV]:
+    """Scan *data* for TLV structures.
+
+    Parameters
+    ----------
+    mode:
+        ``"overlap"`` – report every candidate (overlapping TLVs are possible).
+        ``"exclude"`` – after a match, skip past its value before resuming.
+    """
     total = len(data)
-    result: list[TLV] = []
-    i = 0
-    while i < max(0, total - 1):
-        b0, b1 = data[i], data[i + 1]
-        if 0x00 <= b0 <= 0x10 and b1 in (0x49, 0x4F):
-            if i + 4 <= total:
-                length = data[i + 2] | (data[i + 3] << 8)
-                if i + 4 + length <= total:
-                    result.append(TLV(i, i + 2, i + 4, i + 4 + length))
-                    if mode == "exclude":
-                        i = i + 4 + length
-                        continue
-        i += 1
-    return result
+    tlvs: list[TLV] = []
+    pos = 0
+
+    while pos < total - 1:
+        b0, b1 = data[pos], data[pos + 1]
+        if _is_tag(b0, b1) and pos + 4 <= total:
+            length = data[pos + 2] | (data[pos + 3] << 8)
+            if pos + 4 + length <= total:
+                tlv = TLV(pos, pos + 2, pos + 4, pos + 4 + length)
+                tlvs.append(tlv)
+                if mode == "exclude":
+                    pos = tlv.value_end
+                    continue
+        pos += 1
+
+    return tlvs
 
 
-def build_color_map(tlvs: list[TLV], total: int) -> dict[int, tuple]:
-    cmap: dict[int, tuple[int, int, int]] = {}
-    for t in tlvs:
-        for p in range(t.start, t.tag_end):
-            cmap[p] = _tag_bg()
-        for p in range(t.tag_end, t.len_end):
-            cmap[p] = _len_bg()
-        for p in range(t.len_end, t.value_end):
-            cmap[p] = _val_bg()
+def _is_tag(b0: int, b1: int) -> bool:
+    return 0x00 <= b0 <= TAG_B0_HI and b1 in TAG_B1_SET
+
+
+# ---------------------------------------------------------------------------
+#  Colour-map builder
+# ---------------------------------------------------------------------------
+
+def build_color_map(tlvs: list[TLV], total: int,
+                    scheme: ColorScheme | None = None) -> dict[int, Color]:
+    """Return a per-byte :class:`Color` dictionary covering every TLV field."""
+    if scheme is None:
+        scheme = ColorScheme.from_background()
+    cmap: dict[int, Color] = {}
+    for tlv in tlvs:
+        for p in tlv.tag_range:
+            cmap[p] = scheme.tag
+        for p in tlv.length_range:
+            cmap[p] = scheme.length
+        for p in tlv.value_range:
+            cmap[p] = scheme.value
     return cmap
 
 
-def render_xxd(data: bytes, cmap: dict[int, tuple]) -> str:
+# ---------------------------------------------------------------------------
+#  xxd rendering
+# ---------------------------------------------------------------------------
+
+def render_xxd(data: bytes, cmap: dict[int, Color]) -> str:
+    """Produce an xxd-style hex dump with ANSI-coloured backgrounds."""
     lines: list[str] = []
-    total = len(data)
-
-    for offset in range(0, total, 16):
-        chunk = data[offset:offset + 16]
-        n = len(chunk)
-
-        hex_items = []
-        for j in range(16):
-            if j < n:
-                b = chunk[j]
-                c = _byte_ansi(offset + j, b, cmap)
-                h = f"{b:02x}"
-                hex_items.append(f"{c}{h}")
-            else:
-                hex_items.append("  ")
-
-        left = " ".join(hex_items[:8])
-        right = " ".join(hex_items[8:])
-        hex_line = f"{left}  {right}"
-
-        ascii_chars = []
-        for j in range(16):
-            if j < n:
-                b = chunk[j]
-                c = _byte_ansi(offset + j, b, cmap)
-                ch = chr(b) if 0x20 <= b <= 0x7E else "."
-                ascii_chars.append(f"{c}{ch}")
-            else:
-                ascii_chars.append(" ")
-
-        lines.append(f"{offset:08x}: {hex_line}{_RESET}  {''.join(ascii_chars)}{_RESET}")
-
+    for offset in range(0, len(data), BYTES_PER_LINE):
+        chunk = data[offset:offset + BYTES_PER_LINE]
+        lines.append(_render_line(offset, chunk, cmap))
     return "\n".join(lines)
 
 
+def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color]) -> str:
+    n = len(chunk)
+
+    hex_cells = [
+        _hex_cell(offset + j, chunk[j], cmap) if j < n else "  "
+        for j in range(BYTES_PER_LINE)
+    ]
+    ascii_cells = [
+        _ascii_cell(offset + j, chunk[j], cmap) if j < n else " "
+        for j in range(BYTES_PER_LINE)
+    ]
+
+    left  = " ".join(hex_cells[:HALF_LINE])
+    right = " ".join(hex_cells[HALF_LINE:])
+    hex_line = f"{left}  {right}"
+    ascii_line = "".join(ascii_cells)
+
+    return f"{offset:08x}: {hex_line}{RESET}  {ascii_line}{RESET}"
+
+
+def _hex_cell(offset: int, byte: int, cmap: dict[int, Color]) -> str:
+    bg = cmap.get(offset)
+    fg = char_color(byte)
+    return f"{RESET}{bg_escape(bg)}{fg_escape(fg)}{byte:02x}"
+
+
+def _ascii_cell(offset: int, byte: int, cmap: dict[int, Color]) -> str:
+    bg = cmap.get(offset)
+    fg = char_color(byte)
+    ch = chr(byte) if 0x20 <= byte <= 0x7E else "."
+    return f"{RESET}{bg_escape(bg)}{fg_escape(fg)}{ch}"
+
+
+# ---------------------------------------------------------------------------
+#  CLI entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="TLV heuristic parser — xxd-style output with ANSI colors"
+    ap = argparse.ArgumentParser(
+        description="TLV heuristic parser — xxd-style output with ANSI colours"
     )
-    parser.add_argument("-m", "--mode", choices=["overlap", "exclude"],
-                        default="overlap",
-                        help="parse mode: overlap (default) or exclude")
-    args = parser.parse_args()
+    ap.add_argument(
+        "-m", "--mode",
+        choices=["overlap", "exclude"],
+        default="overlap",
+        help="Parse mode: overlap (default) or exclude consumed bytes",
+    )
+    args = ap.parse_args()
 
     data = sys.stdin.buffer.read()
     if not data:
         return
 
     tlvs = parse(data, mode=args.mode)
-    cmap = build_color_map(tlvs, len(data))
+    scheme = ColorScheme.from_background()
+    cmap = build_color_map(tlvs, len(data), scheme)
     print(render_xxd(data, cmap))
 
 
