@@ -29,10 +29,15 @@ _BaseBlu = (0, 0, 255)
 _Alpha = 0.2
 _DefaultBG = (255, 255, 255)
 
+# Color = ("true", R, G, B) | ("ansi", N) | None
+#   "true"  — truecolor RGB
+#   "ansi"  — traditional ANSI/256 palette index
+#   None    — default terminal color
+
 _CACHED_BG: tuple[int, int, int] | None = None
-_CACHED_TAG_BG: tuple[int, int, int] | None = None
-_CACHED_LEN_BG: tuple[int, int, int] | None = None
-_CACHED_VAL_BG: tuple[int, int, int] | None = None
+_CACHED_TAG_BG: tuple | None = None
+_CACHED_LEN_BG: tuple | None = None
+_CACHED_VAL_BG: tuple | None = None
 
 
 def _bg_color() -> tuple[int, int, int]:
@@ -106,48 +111,64 @@ def _blend(fg_rgb: tuple[int, int, int], bg_rgb: tuple[int, int, int],
     )
 
 
-def _tag_bg() -> tuple[int, int, int]:
+def _tag_bg() -> tuple:
     global _CACHED_TAG_BG
     if _CACHED_TAG_BG is None:
-        _CACHED_TAG_BG = _blend(_BaseRed, _bg_color())
+        _CACHED_TAG_BG = ("true",) + _blend(_BaseRed, _bg_color())
     return _CACHED_TAG_BG
 
 
-def _len_bg() -> tuple[int, int, int]:
+def _len_bg() -> tuple:
     global _CACHED_LEN_BG
     if _CACHED_LEN_BG is None:
-        _CACHED_LEN_BG = _blend(_BaseYel, _bg_color())
+        _CACHED_LEN_BG = ("true",) + _blend(_BaseYel, _bg_color())
     return _CACHED_LEN_BG
 
 
-def _val_bg() -> tuple[int, int, int]:
+def _val_bg() -> tuple:
     global _CACHED_VAL_BG
     if _CACHED_VAL_BG is None:
-        _CACHED_VAL_BG = _blend(_BaseBlu, _bg_color())
+        _CACHED_VAL_BG = ("true",) + _blend(_BaseBlu, _bg_color())
     return _CACHED_VAL_BG
 
 
-def _char_rgb(b: int) -> tuple[int, int, int]:
+def _char_color(b: int) -> tuple:
     if 32 <= b <= 126:
-        return (0, 140, 40)
+        return ("ansi", 32)
     if b in (9, 10, 13):
-        return (160, 130, 0)
+        return ("ansi", 33)
     if b == 0:
-        return (128, 128, 128)
+        return ("ansi", 37)
     if b == 255:
-        return (40, 80, 210)
-    return (200, 30, 30)
+        return ("ansi", 34)
+    return ("ansi", 31)
+
+
+def _bg_ansi(c: tuple | None) -> str:
+    if c is None:
+        return "\033[49m"
+    kind = c[0]
+    if kind == "true":
+        _, r, g, b = c
+        return f"\033[48;2;{r};{g};{b}m"
+    _, code = c
+    return f"\033[{code + 10}m"
+
+
+def _fg_ansi(c: tuple) -> str:
+    kind = c[0]
+    if kind == "true":
+        _, r, g, b = c
+        return f"\033[38;2;{r};{g};{b}m"
+    _, code = c
+    return f"\033[{code}m"
 
 
 def _byte_ansi(offset: int, b: int,
-               cmap: dict[int, tuple[int, int, int]]) -> str:
-    bg_rgb = cmap.get(offset)
-    fg_r = _char_rgb(b)
-    fr, fg, fb = fg_r
-    if bg_rgb is not None:
-        br, bg_bl, bb = bg_rgb
-        return f"\033[0m\033[48;2;{br};{bg_bl};{bb}m\033[38;2;{fr};{fg};{fb}m"
-    return f"\033[0m\033[49m\033[38;2;{fr};{fg};{fb}m"
+               cmap: dict[int, tuple]) -> str:
+    bg = cmap.get(offset)
+    fg = _char_color(b)
+    return f"\033[0m{_bg_ansi(bg)}{_fg_ansi(fg)}"
 
 
 @dataclass
@@ -176,7 +197,7 @@ def parse(data: bytes, mode: str = "overlap") -> list[TLV]:
     return result
 
 
-def build_color_map(tlvs: list[TLV], total: int) -> dict[int, tuple[int, int, int]]:
+def build_color_map(tlvs: list[TLV], total: int) -> dict[int, tuple]:
     cmap: dict[int, tuple[int, int, int]] = {}
     for t in tlvs:
         for p in range(t.start, t.tag_end):
@@ -188,7 +209,7 @@ def build_color_map(tlvs: list[TLV], total: int) -> dict[int, tuple[int, int, in
     return cmap
 
 
-def render_xxd(data: bytes, cmap: dict[int, tuple[int, int, int]]) -> str:
+def render_xxd(data: bytes, cmap: dict[int, tuple]) -> str:
     lines: list[str] = []
     total = len(data)
 
