@@ -19,8 +19,8 @@ import select
 import sys
 import termios
 from dataclasses import dataclass
+from enum import Enum
 from functools import cache
-from typing import Literal
 
 RESET = "\033[0m"
 
@@ -56,6 +56,21 @@ class AnsiColor:
 
 Color = TrueColor | AnsiColor | None
 """The three possible colour states: truecolour, ANSI index, or terminal default."""
+
+
+class ColorMode(Enum):
+    ALL  = "all"
+    FG   = "fg"
+    BG   = "bg"
+    NONE = "none"
+
+    @property
+    def use_bg(self) -> bool:
+        return self in (ColorMode.ALL, ColorMode.BG)
+
+    @property
+    def use_fg(self) -> bool:
+        return self in (ColorMode.ALL, ColorMode.FG)
 
 # ---------------------------------------------------------------------------
 #  Terminal background detection
@@ -153,9 +168,9 @@ RGB = tuple[int, int, int]
 def blend(fg: RGB, bg: RGB, alpha: float = BLEND_ALPHA) -> RGB:
     """Alpha-blend a foreground RGB over a background RGB."""
     return (
-        round(alpha * fg[0] + (1 - alpha) * bg[0]),
-        round(alpha * fg[1] + (1 - alpha) * bg[1]),
-        round(alpha * fg[2] + (1 - alpha) * bg[2]),
+        int(alpha * fg[0] + (1 - alpha) * bg[0]),
+        int(alpha * fg[1] + (1 - alpha) * bg[1]),
+        int(alpha * fg[2] + (1 - alpha) * bg[2]),
     )
 
 
@@ -182,8 +197,13 @@ class ColorScheme:
 #  Character display colour
 # ---------------------------------------------------------------------------
 
-def char_color(byte: int) -> AnsiColor:
-    """ANSI colour for the visual representation of a single byte."""
+def char_color(byte: int, mode: ColorMode = ColorMode.ALL) -> Color:
+    """ANSI colour for the visual representation of a single byte.
+
+    Returns ``None`` when *mode* disables foreground colouring.
+    """
+    if not mode.use_fg:
+        return None
     if 32 <= byte <= 126:
         return AnsiColor(32)   # green — printable ASCII
     if byte in (9, 10, 13):
@@ -312,24 +332,26 @@ def build_color_map(tlvs: list[TLV], total: int,
 #  xxd rendering
 # ---------------------------------------------------------------------------
 
-def render_xxd(data: bytes, cmap: dict[int, Color]) -> str:
+def render_xxd(data: bytes, cmap: dict[int, Color],
+               color_mode: ColorMode = ColorMode.ALL) -> str:
     """Produce an xxd-style hex dump with ANSI-coloured backgrounds."""
     lines: list[str] = []
     for offset in range(0, len(data), BYTES_PER_LINE):
         chunk = data[offset:offset + BYTES_PER_LINE]
-        lines.append(_render_line(offset, chunk, cmap))
+        lines.append(_render_line(offset, chunk, cmap, color_mode))
     return "\n".join(lines)
 
 
-def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color]) -> str:
+def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color],
+                 color_mode: ColorMode) -> str:
     n = len(chunk)
 
     hex_cells = [
-        _hex_cell(offset + j, chunk[j], cmap) if j < n else "  "
+        _hex_cell(offset + j, chunk[j], cmap, color_mode) if j < n else "  "
         for j in range(BYTES_PER_LINE)
     ]
     ascii_cells = [
-        _ascii_cell(offset + j, chunk[j], cmap) if j < n else " "
+        _ascii_cell(offset + j, chunk[j], cmap, color_mode) if j < n else " "
         for j in range(BYTES_PER_LINE)
     ]
 
@@ -338,20 +360,39 @@ def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color]) -> str:
     hex_line = f"{left}  {right}"
     ascii_line = "".join(ascii_cells)
 
+    if color_mode is ColorMode.NONE:
+        return f"{offset:08x}: {hex_line}  {ascii_line}"
     return f"{offset:08x}: {hex_line}{RESET}  {ascii_line}{RESET}"
 
 
-def _hex_cell(offset: int, byte: int, cmap: dict[int, Color]) -> str:
-    bg = cmap.get(offset)
-    fg = char_color(byte)
-    return f"{RESET}{bg_escape(bg)}{fg_escape(fg)}{byte:02x}"
+def _hex_cell(offset: int, byte: int, cmap: dict[int, Color],
+              color_mode: ColorMode) -> str:
+    if color_mode is ColorMode.NONE:
+        return f"{byte:02x}"
+
+    parts = [RESET]
+    if color_mode.use_bg:
+        parts.append(bg_escape(cmap.get(offset)))
+    if color_mode.use_fg:
+        parts.append(fg_escape(char_color(byte, color_mode)))
+    parts.append(f"{byte:02x}")
+    return "".join(parts)
 
 
-def _ascii_cell(offset: int, byte: int, cmap: dict[int, Color]) -> str:
-    bg = cmap.get(offset)
-    fg = char_color(byte)
+def _ascii_cell(offset: int, byte: int, cmap: dict[int, Color],
+                color_mode: ColorMode) -> str:
+    if color_mode is ColorMode.NONE:
+        ch = chr(byte) if 0x20 <= byte <= 0x7E else "."
+        return ch
+
+    parts = [RESET]
+    if color_mode.use_bg:
+        parts.append(bg_escape(cmap.get(offset)))
+    if color_mode.use_fg:
+        parts.append(fg_escape(char_color(byte, color_mode)))
     ch = chr(byte) if 0x20 <= byte <= 0x7E else "."
-    return f"{RESET}{bg_escape(bg)}{fg_escape(fg)}{ch}"
+    parts.append(ch)
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -368,16 +409,28 @@ def main() -> None:
         default="overlap",
         help="Parse mode: overlap (default) or exclude consumed bytes",
     )
+    ap.add_argument(
+        "-c", "--color",
+        choices=[m.value for m in ColorMode],
+        default=ColorMode.ALL.value,
+        help="Colouring: all (default), fg (foreground only), bg (background only), none",
+    )
     args = ap.parse_args()
 
     data = sys.stdin.buffer.read()
     if not data:
         return
 
+    color_mode = ColorMode(args.color)
     tlvs = parse(data, mode=args.mode)
-    scheme = ColorScheme.from_background()
-    cmap = build_color_map(tlvs, len(data), scheme)
-    print(render_xxd(data, cmap))
+
+    if color_mode.use_bg:
+        scheme = ColorScheme.from_background()
+        cmap = build_color_map(tlvs, len(data), scheme)
+    else:
+        cmap = {}
+
+    print(render_xxd(data, cmap, color_mode))
 
 
 if __name__ == "__main__":
