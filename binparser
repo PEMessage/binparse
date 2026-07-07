@@ -583,6 +583,12 @@ def main() -> None:
         default=True,
         help="Print field summary after the hex dump (default: true)",
     )
+    ap.add_argument(
+        "--show-trailing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include trailing raw/padding autofix fields (default: false)",
+    )
     args = ap.parse_args()
 
     data = sys.stdin.buffer.read()
@@ -592,6 +598,10 @@ def main() -> None:
     parser_cls = PARSERS[args.struct]
     color_mode = ColorMode(args.color)
     fields = parse(data, parser_cls)
+
+    if not args.show_trailing:
+        while fields and fields[-1].name in ("raw", "padding"):
+            fields.pop()
 
     unique_names = list(dict.fromkeys(f.name for f in fields))
     field_colors = auto_colors(unique_names) if color_mode.use_bg else {}
