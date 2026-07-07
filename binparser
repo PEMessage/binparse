@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
-"""TLV heuristic parser — xxd-style output with ANSI color highlighting.
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "hachoir>=3.3.0",
+# ]
+# ///
 
-Reads a byte stream from stdin, finds all valid TLV structures, and renders
-them with colored backgrounds in xxd format.
+"""Binary struct parser — xxd-style output with ANSI color highlighting.
 
-TLV format:
-    TAG (2B): B0 in [0x00, 0x10], B1 in {'I','O'}
-    LEN (2B): little-endian value length
-    VALUE (nB)
+Reads a byte stream from stdin, parses it as repetitions of a C struct using
+hachoir, then renders a coloured hex dump with each field highlighted.
+
+C struct (Entry, 16 bytes, little-endian)::
+
+    uint32_t id;          4 B — record identifier
+    uint32_t timestamp;   4 B — epoch seconds
+    uint16_t type;        2 B — record type
+    uint16_t value;       2 B — data value
+    uint8_t  flag;        1 B — flag bits
+    uint8_t  reserved[3]; 3 B — padding
+
+Input that is not a multiple of 16 bytes has the trailing bytes rendered
+as raw (un-highlighted).
 """
 
 from __future__ import annotations
@@ -22,6 +37,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
+from typing import Any
+
+from hachoir.core.endian import LITTLE_ENDIAN
+from hachoir.core.log import log as _hachoir_log
+from hachoir.field import FieldSet, RawBytes, UInt8, UInt16, UInt32
+from hachoir.parser import Parser
+from hachoir.stream import StringInputStream
+
+_hachoir_log.use_print = False
 
 RESET = "\033[0m"
 
@@ -30,8 +54,31 @@ DEFAULT_BG = (255, 255, 255)
 BYTES_PER_LINE = 16
 HALF_LINE = BYTES_PER_LINE // 2
 
-TAG_B0_HI = 0x10
-TAG_B1_SET = {0x49, 0x4F}  # 'I', 'O'
+# ---------------------------------------------------------------------------
+#  Hachoir-based C‑struct parser
+# ---------------------------------------------------------------------------
+
+class Entry(FieldSet):
+    """One 16-byte record."""
+
+    def createFields(self) -> None:
+        yield UInt32(self, "id")
+        yield UInt32(self, "timestamp")
+        yield UInt16(self, "type")
+        yield UInt16(self, "value")
+        yield UInt8(self, "flag")
+        yield RawBytes(self, "reserved", 3)
+
+
+class StructParser(Parser):
+    """Parser that consumes a stream of fixed-size Entry records."""
+
+    endian = LITTLE_ENDIAN
+
+    def createFields(self) -> None:
+        while not self.eof:
+            yield Entry(self, "entry[]")
+
 
 # ---------------------------------------------------------------------------
 #  Color types — tagged unions for safe, readable colour handling
@@ -40,6 +87,7 @@ TAG_B1_SET = {0x49, 0x4F}  # 'I', 'O'
 @dataclass(frozen=True)
 class TrueColor:
     """24-bit RGB background / foreground."""
+
     r: int
     g: int
     b: int
@@ -48,12 +96,14 @@ class TrueColor:
 @dataclass(frozen=True)
 class AnsiColor:
     """Traditional ANSI palette / 256-color index."""
+
     code: int
 
 
 @dataclass(frozen=True)
 class AlphaColor:
     """RGBA colour that is blended against the terminal background at render time."""
+
     r: int
     g: int
     b: int
@@ -65,9 +115,9 @@ Color = TrueColor | AnsiColor | AlphaColor | None
 
 
 class ColorMode(Enum):
-    ALL  = "all"
-    FG   = "fg"
-    BG   = "bg"
+    ALL = "all"
+    FG = "fg"
+    BG = "bg"
     NONE = "none"
 
     @property
@@ -78,9 +128,11 @@ class ColorMode(Enum):
     def use_fg(self) -> bool:
         return self in (ColorMode.ALL, ColorMode.FG)
 
+
 # ---------------------------------------------------------------------------
 #  Terminal background detection
 # ---------------------------------------------------------------------------
+
 
 @cache
 def detect_terminal_background() -> tuple[int, int, int]:
@@ -165,51 +217,81 @@ def _parse_osc11_response(data: bytes) -> tuple[int, int, int] | None:
 
 
 # ---------------------------------------------------------------------------
-#  Colour scheme
+#  Auto-generated field colours
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class ColorScheme:
-    """Base (unblended) colours for the three TLV fields.
+_GOLDEN_RATIO_CONJUGATE = 0.618033988749895
 
-    Blending against the terminal background is deferred to render time
-    via :func:`_resolve_alpha`, which uses :func:`detect_terminal_background`
-    (cached — OSC 11 is queried at most once).
+
+def _hsl_to_rgb(h: float, s: float, l: float) -> tuple[int, int, int]:
+    """HSL → RGB24.  *h*, *s*, *l* in [0, 1]."""
+
+    def _hue2rgb(p: float, q: float, t: float) -> float:
+        if t < 0:
+            t += 1
+        if t > 1:
+            t -= 1
+        if t < 1 / 6:
+            return p + (q - p) * 6 * t
+        if t < 1 / 2:
+            return q
+        if t < 2 / 3:
+            return p + (q - p) * (2 / 3 - t) * 6
+        return p
+
+    if s == 0:
+        return (int(l * 255),) * 3  # type: ignore[return-value]
+    q = l * (1 + s) if l < 0.5 else l + s - l * s
+    p = 2 * l - q
+    return (
+        int(_hue2rgb(p, q, h + 1 / 3) * 255),
+        int(_hue2rgb(p, q, h) * 255),
+        int(_hue2rgb(p, q, h - 1 / 3) * 255),
+    )
+
+
+def auto_colors(
+    names: list[str],
+    saturation: float = 0.7,
+    lightness: float = 0.7,
+    alpha: float = 0.20,
+) -> dict[str, AlphaColor]:
+    """Generate visually distinct background colours for *names*.
+
+    Hues are distributed using the golden-ratio conjugate so that any
+    number of fields get evenly-spaced, distinguishable colours.
+    Stable across calls: same *names* in the same order → same result.
     """
-
-    tag:    AlphaColor
-    length: AlphaColor
-    value:  AlphaColor
-
-    @classmethod
-    def default(cls) -> ColorScheme:
-        return cls(
-            tag    = AlphaColor(255, 0,   0,   0.2),
-            length = AlphaColor(255, 255, 0,   0.2),
-            value  = AlphaColor(0,   0,   255, 0.2),
-        )
-
+    colors: dict[str, AlphaColor] = {}
+    hue = 0.0
+    for name in names:
+        r, g, b = _hsl_to_rgb(hue, saturation, lightness)
+        colors[name] = AlphaColor(r, g, b, alpha)
+        hue = (hue + _GOLDEN_RATIO_CONJUGATE) % 1.0
+    return colors
 
 # ---------------------------------------------------------------------------
 #  Character display colour
 # ---------------------------------------------------------------------------
 
+
 def char_color(byte: int) -> Color:
     """ANSI colour for the visual representation of a single byte."""
     if 32 <= byte <= 126:
-        return AnsiColor(32)   # green — printable ASCII
+        return AnsiColor(32)  # green — printable ASCII
     if byte in (9, 10, 13):
-        return AnsiColor(33)   # yellow — whitespace
+        return AnsiColor(33)  # yellow — whitespace
     if byte == 0:
-        return AnsiColor(37)   # white — NUL
+        return AnsiColor(37)  # white — NUL
     if byte == 255:
-        return AnsiColor(34)   # blue — 0xFF
-    return AnsiColor(31)       # red — other control chars
+        return AnsiColor(34)  # blue — 0xFF
+    return AnsiColor(31)  # red — other control chars
 
 
 # ---------------------------------------------------------------------------
 #  ANSI escape generators
 # ---------------------------------------------------------------------------
+
 
 @cache
 def _resolve_alpha(c: AlphaColor) -> TrueColor:
@@ -250,85 +332,67 @@ def fg_escape(c: Color) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  TLV model
+#  Field-span model
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
-class TLV:
-    """A parsed TLV structure, storing byte-offset boundaries."""
+class FieldSpan:
+    """Byte range and metadata for a single parsed field."""
 
-    offset:    int
-    tag_end:   int
-    len_end:   int
-    value_end: int
-
-    def __len__(self) -> int:
-        return self.value_end - self.offset
+    name: str
+    offset: int
+    size: int
+    value: Any
 
     @property
-    def tag_range(self) -> range:
-        return range(self.offset, self.tag_end)
-
-    @property
-    def length_range(self) -> range:
-        return range(self.tag_end, self.len_end)
-
-    @property
-    def value_range(self) -> range:
-        return range(self.len_end, self.value_end)
+    def byte_range(self) -> range:
+        return range(self.offset, self.offset + self.size)
 
 
 # ---------------------------------------------------------------------------
 #  Parsing
 # ---------------------------------------------------------------------------
 
-def parse(data: bytes, mode: str = "overlap") -> list[TLV]:
-    """Scan *data* for TLV structures.
 
-    Parameters
-    ----------
-    mode:
-        ``"overlap"`` – report every candidate (overlapping TLVs are possible).
-        ``"exclude"`` – after a match, skip past its value before resuming.
-    """
-    total = len(data)
-    tlvs: list[TLV] = []
-    pos = 0
-
-    while pos < total - 1:
-        b0, b1 = data[pos], data[pos + 1]
-        if _is_tag(b0, b1) and pos + 4 <= total:
-            length = data[pos + 2] | (data[pos + 3] << 8)
-            if pos + 4 + length <= total:
-                tlv = TLV(pos, pos + 2, pos + 4, pos + 4 + length)
-                tlvs.append(tlv)
-                if mode == "exclude":
-                    pos = tlv.value_end
-                    continue
-        pos += 1
-
-    return tlvs
+def parse(data: bytes) -> list[FieldSpan]:
+    """Parse *data* with hachoir, extracting leaf-field byte ranges."""
+    stream = StringInputStream(data)
+    parser = StructParser(stream)
+    return _extract_fields(parser["/"])
 
 
-def _is_tag(b0: int, b1: int) -> bool:
-    return 0x00 <= b0 <= TAG_B0_HI and b1 in TAG_B1_SET
+def _extract_fields(field: Any) -> list[FieldSpan]:
+    spans: list[FieldSpan] = []
+    if hasattr(field, "__iter__") and not isinstance(
+        field, (UInt32, UInt16, UInt8, RawBytes)
+    ):
+        for sub in field:
+            spans.extend(_extract_fields(sub))
+    else:
+        abs_addr = field.absolute_address // 8
+        size = field.size // 8
+        name = field.name.rstrip("[]")
+        spans.append(FieldSpan(name, abs_addr, size, field.value))
+    return spans
 
 
 # ---------------------------------------------------------------------------
-#  TLV summary
+#  Field summary
 # ---------------------------------------------------------------------------
 
-def tlv_info(tlvs: list[TLV], data: bytes) -> str:
-    """Return a human-readable summary of each parsed TLV."""
-    if not tlvs:
+
+def field_info(fields: list[FieldSpan]) -> str:
+    """Return a human-readable summary of each parsed field."""
+    if not fields:
         return ""
     lines: list[str] = []
-    for i, tlv in enumerate(tlvs):
-        b0 = data[tlv.offset]
-        b1 = data[tlv.offset + 1]
-        length = data[tlv.tag_end] | (data[tlv.tag_end + 1] << 8)
-        tag_str = f"{b0},{chr(b1)!r}"
-        lines.append(f"{i}:  offset={tlv.offset:#06x}  TAG: {tag_str}  LEN: {length}")
+    for i, f in enumerate(fields):
+        val_repr = repr(f.value)
+        lines.append(
+            f"{i:3d}:  offset={f.offset:#06x}  size={f.size:2d}  "
+            f"{f.name:12s}  value={val_repr}"
+        )
     return "\n".join(lines)
 
 
@@ -336,16 +400,15 @@ def tlv_info(tlvs: list[TLV], data: bytes) -> str:
 #  Render palette — bundles all colour decisions for one render pass
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class RenderPalette:
     """Per-field background colours and a foreground colour function.
 
-    When every field is ``None`` the render path naturally produces plain text.
+    When ``field_colors`` is empty the render path naturally produces plain text.
     """
 
-    tag_bg:  Color = None
-    len_bg:  Color = None
-    val_bg:  Color = None
+    field_colors: dict[str, Color]
     char_fg: Callable[[int], Color] | None = None
 
 
@@ -353,32 +416,35 @@ class RenderPalette:
 #  xxd rendering
 # ---------------------------------------------------------------------------
 
-def render_xxd(data: bytes, tlvs: list[TLV], palette: RenderPalette) -> str:
+
+def render_xxd(data: bytes, fields: list[FieldSpan], palette: RenderPalette) -> str:
     """Produce an xxd-style hex dump with ANSI-coloured backgrounds."""
-    cmap = _build_cmap_from_tlvs(tlvs, palette)
-    char_fg = palette.char_fg
+    cmap = _build_cmap_from_fields(fields, palette)
     lines: list[str] = []
     for offset in range(0, len(data), BYTES_PER_LINE):
-        chunk = data[offset:offset + BYTES_PER_LINE]
-        lines.append(_render_line(offset, chunk, cmap, char_fg))
+        chunk = data[offset : offset + BYTES_PER_LINE]
+        lines.append(_render_line(offset, chunk, cmap, palette.char_fg))
     return "\n".join(lines)
 
 
-def _build_cmap_from_tlvs(tlvs: list[TLV],
-                          palette: RenderPalette) -> dict[int, Color]:
+def _build_cmap_from_fields(
+    fields: list[FieldSpan],
+    palette: RenderPalette,
+) -> dict[int, Color]:
     cmap: dict[int, Color] = {}
-    for tlv in tlvs:
-        for p in tlv.tag_range:
-            cmap[p] = palette.tag_bg
-        for p in tlv.length_range:
-            cmap[p] = palette.len_bg
-        for p in tlv.value_range:
-            cmap[p] = palette.val_bg
+    for f in fields:
+        color = palette.field_colors.get(f.name)
+        for p in f.byte_range:
+            cmap[p] = color
     return cmap
 
 
-def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color],
-                 char_fg: Callable[[int], Color] | None) -> str:
+def _render_line(
+    offset: int,
+    chunk: bytes,
+    cmap: dict[int, Color],
+    char_fg: Callable[[int], Color] | None,
+) -> str:
     n = len(chunk)
 
     hex_cells = [
@@ -390,7 +456,7 @@ def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color],
         for j in range(BYTES_PER_LINE)
     ]
 
-    left  = " ".join(hex_cells[:HALF_LINE])
+    left = " ".join(hex_cells[:HALF_LINE])
     right = " ".join(hex_cells[HALF_LINE:])
     hex_line = f"{left}  {right}"
     ascii_line = "".join(ascii_cells)
@@ -398,15 +464,23 @@ def _render_line(offset: int, chunk: bytes, cmap: dict[int, Color],
     return f"{offset:08x}: {hex_line}{RESET}  {ascii_line}{RESET}"
 
 
-def _hex_cell(offset: int, byte: int, cmap: dict[int, Color],
-              char_fg: Callable[[int], Color] | None) -> str:
+def _hex_cell(
+    offset: int,
+    byte: int,
+    cmap: dict[int, Color],
+    char_fg: Callable[[int], Color] | None,
+) -> str:
     bg = cmap.get(offset)
     fg = char_fg(byte) if char_fg else None
     return f"{RESET}{bg_escape(bg)}{fg_escape(fg)}{byte:02x}"
 
 
-def _ascii_cell(offset: int, byte: int, cmap: dict[int, Color],
-                char_fg: Callable[[int], Color] | None) -> str:
+def _ascii_cell(
+    offset: int,
+    byte: int,
+    cmap: dict[int, Color],
+    char_fg: Callable[[int], Color] | None,
+) -> str:
     bg = cmap.get(offset)
     fg = char_fg(byte) if char_fg else None
     ch = chr(byte) if 0x20 <= byte <= 0x7E else "."
@@ -417,18 +491,14 @@ def _ascii_cell(offset: int, byte: int, cmap: dict[int, Color],
 #  CLI entry point
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="TLV heuristic parser — xxd-style output with ANSI colours"
+        description="Binary struct parser — xxd-style output with ANSI colours"
     )
     ap.add_argument(
-        "-m", "--mode",
-        choices=["overlap", "exclude"],
-        default="overlap",
-        help="Parse mode: overlap (default) or exclude consumed bytes",
-    )
-    ap.add_argument(
-        "-c", "--color",
+        "-c",
+        "--color",
         choices=[m.value for m in ColorMode],
         default=ColorMode.ALL.value,
         help="Colouring: all (default), fg (foreground only), bg (background only), none",
@@ -437,7 +507,7 @@ def main() -> None:
         "--show-info",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Print TLV summary after the hex dump (default: true)",
+        help="Print field summary after the hex dump (default: true)",
     )
     args = ap.parse_args()
 
@@ -446,24 +516,19 @@ def main() -> None:
         return
 
     color_mode = ColorMode(args.color)
-    tlvs = parse(data, mode=args.mode)
+    fields = parse(data)
 
-    if color_mode.use_bg:
-        scheme = ColorScheme.default()
-        palette = RenderPalette(
-            tag_bg  = scheme.tag,
-            len_bg  = scheme.length,
-            val_bg  = scheme.value,
-            char_fg = char_color if color_mode.use_fg else None,
-        )
-    else:
-        palette = RenderPalette(
-            char_fg = char_color if color_mode.use_fg else None,
-        )
+    unique_names = list(dict.fromkeys(f.name for f in fields))
+    field_colors = auto_colors(unique_names) if color_mode.use_bg else {}
 
-    print(render_xxd(data, tlvs, palette))
+    palette = RenderPalette(
+        field_colors=field_colors,
+        char_fg=char_color if color_mode.use_fg else None,
+    )
+
+    print(render_xxd(data, fields, palette))
     if args.show_info:
-        info = tlv_info(tlvs, data)
+        info = field_info(fields)
         if info:
             print(info)
 
