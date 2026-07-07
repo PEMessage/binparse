@@ -114,15 +114,18 @@ class DemoBParser(Parser):
 # --- Third parser: ASN.1 BER/DER (TLV with variable-length tag & length) ---
 
 
-class RawInt(RawBytes):
-    """Like RawBytes but stores an explicit integer value."""
+class ComputedBytes(RawBytes):
+    """RawBytes that returns a pre-computed value of any type, instead of
+    reading raw bytes from the stream.  This is the idiomatic hachoir
+    pattern: subclass and override ``createValue()``.
+    """
 
-    def __init__(self, parent, name, length, value=None, description="Raw data"):
+    def __init__(self, parent, name, length, value, description="Raw data"):
         super().__init__(parent, name, length, description)
-        self._rawint_value = value
+        self._value = value
 
     def createValue(self):
-        return self._rawint_value
+        return self._value
 
 
 class ASN1TLV(FieldSet):
@@ -163,7 +166,7 @@ class ASN1TLV(FieldSet):
                 total = (total << 8) | self.stream.readBytes(
                     bit_pos + (1 + i) * 8, 1
                 )[0]
-        yield RawInt(self, "length", len_size, value=total)
+        yield ComputedBytes(self, "length", len_size, value=total)
 
         # --- Value ---
         if total > 0:
@@ -696,9 +699,8 @@ def _parse_common_args() -> argparse.Namespace:
     sp_dump = sub.add_parser("dump", help="Dump raw bytes of a field by index")
     _add_common_args(sp_dump)
     sp_dump.add_argument(
-        "--index",
+        "index",
         type=int,
-        required=True,
         help="Field index to dump",
     )
     sp_dump.add_argument(
