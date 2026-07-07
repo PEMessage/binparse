@@ -463,20 +463,10 @@ def _collect_leaf_names(root: Field) -> list[str]:
     return names
 
 
-def _trailing_ids(root: Field) -> set[int]:
-    leaves = list(_walk_leaves(root))
-    skip: set[int] = set()
-    while leaves:
-        field, _path = leaves[-1]
-        name = field.name
-        if name.endswith("[]"):
-            name = name[:-2]
-        if name in ("raw", "padding"):
-            skip.add(id(field))
-            leaves.pop()
-        else:
-            break
-    return skip
+def _is_autofix_field(name: str) -> bool:
+    if name.endswith("[]"):
+        name = name[:-2]
+    return name in ("raw", "padding")
 
 
 # ---------------------------------------------------------------------------
@@ -516,32 +506,39 @@ def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, i
 
 
 def render_field_info(
-    field: Field, palette: RenderPalette, skip_ids: set[int] | None = None, indent: int = 0,
-    print_abs_path: bool = False,
+    field: Field, palette: RenderPalette, args: argparse.Namespace, indent: int = 0,
+    _counter: list[int] | None = None,
 ) -> str:
+    if _counter is None:
+        _counter = [0]
     parts: list[str] = []
     if getattr(field, "is_field_set", False):
         is_root = field.parent is None
         if not is_root:
-            display_name = _build_abs_path(field) if print_abs_path else field.name
+            idx = _counter[0]
+            _counter[0] += 1
+            display_name = _build_abs_path(field) if args.print_abs_path else field.name
             off = field.absolute_address // 8
             sz = field.size // 8
-            parts.append(f"{'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
+            parts.append(f"[{idx:3d}] {'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
             next_indent = indent + 1
         else:
             next_indent = indent
         for sub in field:
-            sub_part = render_field_info(sub, palette, skip_ids, next_indent, print_abs_path)
+            sub_part = render_field_info(sub, palette, args, next_indent, _counter)
             if sub_part:
                 parts.append(sub_part)
     else:
-        if skip_ids and id(field) in skip_ids:
+        if not args.show_trailing and _is_autofix_field(field.name):
             return ""
+        idx = _counter[0]
+        _counter[0] += 1
         name = field.name
-        if not print_abs_path and name.endswith("[]"):
+        if not args.print_abs_path and name.endswith("[]"):
             name = name[:-2]
-        display_name = _build_abs_path(field) if print_abs_path else name
-        parts.append(_format_leaf_line(field, display_name, palette, indent))
+        display_name = _build_abs_path(field) if args.print_abs_path else name
+        line = _format_leaf_line(field, display_name, palette, indent)
+        parts.append(f"[{idx:3d}] {line}")
     return "\n".join(parts)
 
 
@@ -567,10 +564,10 @@ class RenderPalette:
 
 
 def render_xxd(
-    data: bytes, root: Field, palette: RenderPalette, skip_ids: set[int] | None = None
+    data: bytes, root: Field, palette: RenderPalette, args: argparse.Namespace,
 ) -> str:
     lines: list[str] = []
-    cmap = _build_cmap(root, palette, skip_ids)
+    cmap = _build_cmap(root, palette, args)
     for offset in range(0, len(data), BYTES_PER_LINE):
         chunk = data[offset : offset + BYTES_PER_LINE]
         lines.append(_render_line(offset, chunk, cmap, palette.char_fg))
@@ -578,11 +575,11 @@ def render_xxd(
 
 
 def _build_cmap(
-    root: Field, palette: RenderPalette, skip_ids: set[int] | None = None
+    root: Field, palette: RenderPalette, args: argparse.Namespace,
 ) -> dict[int, Color]:
     cmap: dict[int, Color] = {}
     for field, _path in _walk_leaves(root):
-        if skip_ids and id(field) in skip_ids:
+        if not args.show_trailing and _is_autofix_field(field.name):
             continue
         name = field.name
         if name.endswith("[]"):
@@ -716,8 +713,6 @@ def main() -> None:
 
     assert isinstance(root, Field)
 
-    skip_ids = set() if args.show_trailing else _trailing_ids(root)
-
     unique_names = list(dict.fromkeys(_collect_leaf_names(root)))
     field_colors: dict[str, Color] = auto_colors(unique_names) if color_mode.use_bg else {}
 
@@ -726,9 +721,9 @@ def main() -> None:
         char_fg=char_color if color_mode.use_fg else None,
     )
 
-    print(render_xxd(data, root, palette, skip_ids))
+    print(render_xxd(data, root, palette, args))
     if args.show_info:
-        info = render_field_info(root, palette, skip_ids, print_abs_path=args.print_abs_path)
+        info = render_field_info(root, palette, args)
         if info:
             print(info)
 
