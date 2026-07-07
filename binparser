@@ -755,12 +755,11 @@ def _parse_root(args: argparse.Namespace, data: bytes) -> Field:
 def cmd_show(args: argparse.Namespace, data: bytes, root: Field) -> None:
     color_mode = ColorMode(args.color)
 
-    unique_names = list(dict.fromkeys(_collect_leaf_names(root)))
-    field_colors: dict[str, Color] = auto_colors(unique_names) if color_mode.use_bg else {}
 
+    unique_names = list(dict.fromkeys(_collect_leaf_names(root)))
     palette = RenderPalette(
-        field_colors=field_colors,
-        char_fg=char_color if color_mode.use_fg else None,
+        field_colors = auto_colors(names=unique_names) if color_mode.use_bg else {},
+        char_fg = char_color if color_mode.use_fg else None,
     )
 
     print(render_xxd(data, root, palette, args))
