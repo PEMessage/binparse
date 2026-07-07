@@ -55,8 +55,11 @@ BYTES_PER_LINE = 16
 HALF_LINE = BYTES_PER_LINE // 2
 
 # ---------------------------------------------------------------------------
-#  Hachoir-based C‑struct parser
+#  Hachoir-based C‑struct parsers
 # ---------------------------------------------------------------------------
+# To add a new parser, define a FieldSet + Parser subclass, then add the
+# Parser to the PARSERS registry at the bottom of this block.  Everything
+# else (extraction, colouring, info formatting, rendering) stays untouched.
 
 class Entry(FieldSet):
     """One 16-byte record."""
@@ -70,14 +73,47 @@ class Entry(FieldSet):
         yield RawBytes(self, "reserved", 3)
 
 
-class StructParser(Parser):
-    """Parser that consumes a stream of fixed-size Entry records."""
+class EntryParser(Parser):
+    """Repeated fixed-size Entry records."""
 
     endian = LITTLE_ENDIAN
 
     def createFields(self) -> None:
         while not self.eof:
             yield Entry(self, "entry[]")
+
+
+# --- Second parser: demonstrates nested containers (no repeated entries) ---
+
+
+class FileHeader(FieldSet):
+    def createFields(self) -> None:
+        yield UInt32(self, "magic")
+        yield UInt16(self, "version")
+        yield UInt16(self, "flags")
+
+
+class InfoBlock(FieldSet):
+    def createFields(self) -> None:
+        yield UInt32(self, "width")
+        yield UInt32(self, "height")
+        yield UInt16(self, "depth")
+
+
+class FileParser(Parser):
+    """Two named sections — flat hierarchy, no repetition."""
+
+    endian = LITTLE_ENDIAN
+
+    def createFields(self) -> None:
+        yield FileHeader(self, "header")
+        yield InfoBlock(self, "info")
+
+
+PARSERS: dict[str, type[Parser]] = {
+    "struct": EntryParser,
+    "file":   FileParser,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -338,12 +374,18 @@ def fg_escape(c: Color) -> str:
 
 @dataclass(frozen=True)
 class FieldSpan:
-    """Byte range and metadata for a single parsed field."""
+    """Byte range and metadata for a single parsed field.
+
+    *path* records the sequence of ancestor field-set names, e.g.
+    ``("entry[0]",)`` or ``("file_header",)``.  Derived entirely from
+    the parser struct tree — no names are hard-coded.
+    """
 
     name: str
     offset: int
     size: int
     value: Any
+    path: tuple[str, ...] = ()
 
     @property
     def byte_range(self) -> range:
@@ -355,25 +397,27 @@ class FieldSpan:
 # ---------------------------------------------------------------------------
 
 
-def parse(data: bytes) -> list[FieldSpan]:
-    """Parse *data* with hachoir, extracting leaf-field byte ranges."""
+def parse(data: bytes, parser_cls: type[Parser]) -> list[FieldSpan]:
+    """Parse *data* with *parser_cls*, extracting leaf-field byte ranges."""
     stream = StringInputStream(data)
-    parser = StructParser(stream)
+    parser = parser_cls(stream)
     return _extract_fields(parser["/"])
 
 
-def _extract_fields(field: Any) -> list[FieldSpan]:
+def _extract_fields(field: Any, path: tuple[str, ...] = ()) -> list[FieldSpan]:
     spans: list[FieldSpan] = []
     if hasattr(field, "__iter__") and not isinstance(
         field, (UInt32, UInt16, UInt8, RawBytes)
     ):
+        parent = getattr(field, "parent", None)
+        child_path = path + (field.name,) if parent is not None else path
         for sub in field:
-            spans.extend(_extract_fields(sub))
+            spans.extend(_extract_fields(sub, child_path))
     else:
         abs_addr = field.absolute_address // 8
         size = field.size // 8
         name = field.name.rstrip("[]")
-        spans.append(FieldSpan(name, abs_addr, size, field.value))
+        spans.append(FieldSpan(name, abs_addr, size, field.value, path))
     return spans
 
 
@@ -383,17 +427,33 @@ def _extract_fields(field: Any) -> list[FieldSpan]:
 
 
 def field_info(fields: list[FieldSpan]) -> str:
-    """Return a human-readable summary of each parsed field."""
+    """Return a human-readable summary.
+
+    Group headers are derived from the *path* attribute, so the output
+    automatically adapts to whatever hierarchy the parser produces.
+    """
     if not fields:
         return ""
     lines: list[str] = []
-    for i, f in enumerate(fields):
+    last_path: tuple[str, ...] = ()
+    for f in fields:
+        common = 0
+        for a, b in zip(last_path, f.path):
+            if a != b:
+                break
+            common += 1
+        for i in range(common, len(f.path)):
+            indent = "  " * i
+            lines.append(f"\n{indent}{f.path[i]}:")
+        last_path = f.path
+
+        indent = "  " * len(f.path)
         val_repr = repr(f.value)
         lines.append(
-            f"{i:3d}:  offset={f.offset:#06x}  size={f.size:2d}  "
-            f"{f.name:12s}  value={val_repr}"
+            f"{indent}{f.name:12s}  offset={f.offset:#06x}  "
+            f"size={f.size:2d}  value={val_repr}"
         )
-    return "\n".join(lines)
+    return "\n".join(lines).lstrip("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +557,13 @@ def main() -> None:
         description="Binary struct parser — xxd-style output with ANSI colours"
     )
     ap.add_argument(
+        "-s",
+        "--struct",
+        choices=list(PARSERS),
+        required=True,
+        help="Parser to use (%(choices)s)",
+    )
+    ap.add_argument(
         "-c",
         "--color",
         choices=[m.value for m in ColorMode],
@@ -515,8 +582,9 @@ def main() -> None:
     if not data:
         return
 
+    parser_cls = PARSERS[args.struct]
     color_mode = ColorMode(args.color)
-    fields = parse(data)
+    fields = parse(data, parser_cls)
 
     unique_names = list(dict.fromkeys(f.name for f in fields))
     field_colors = auto_colors(unique_names) if color_mode.use_bg else {}
