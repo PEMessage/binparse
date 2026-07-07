@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate test data for ``binparser -s struct``.
+"""Generate test data for ``binparser -s demoA``.
 
-Entry (16 bytes, little-endian)::
+DemoA (16 bytes, little-endian)::
 
     uint32_t id;
     uint32_t timestamp;
@@ -17,7 +17,7 @@ import sys
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate binary data for -s struct")
+    ap = argparse.ArgumentParser(description="Generate binary data for -s demoA")
     ap.add_argument("-n", type=int, default=5, help="Number of records (default: 5)")
     ap.add_argument("--partial", action="store_true", help="Append truncated trailing record")
     args = ap.parse_args()

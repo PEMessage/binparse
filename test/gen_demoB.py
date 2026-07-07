@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate test data for ``binparser -s file``.
+"""Generate test data for ``binparser -s demoB``.
 
     struct header  { uint32_t magic; uint16_t version; uint16_t flags; };   // 8 B
     struct info    { uint32_t width; uint32_t height; uint16_t depth; };    // 10 B

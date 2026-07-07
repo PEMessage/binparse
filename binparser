@@ -61,7 +61,7 @@ HALF_LINE = BYTES_PER_LINE // 2
 # Parser to the PARSERS registry at the bottom of this block.  Everything
 # else (extraction, colouring, info formatting, rendering) stays untouched.
 
-class Entry(FieldSet):
+class DemoA(FieldSet):
     """One 16-byte record."""
 
     def createFields(self) -> None:
@@ -73,46 +73,46 @@ class Entry(FieldSet):
         yield RawBytes(self, "reserved", 3)
 
 
-class EntryParser(Parser):
-    """Repeated fixed-size Entry records."""
+class DemoAParser(Parser):
+    """Repeated fixed-size DemoA records."""
 
     endian = LITTLE_ENDIAN
 
     def createFields(self) -> None:
         while not self.eof:
-            yield Entry(self, "entry[]")
+            yield DemoA(self, "entry[]")
 
 
 # --- Second parser: demonstrates nested containers (no repeated entries) ---
 
 
-class FileHeader(FieldSet):
+class DemoBHeader(FieldSet):
     def createFields(self) -> None:
         yield UInt32(self, "magic")
         yield UInt16(self, "version")
         yield UInt16(self, "flags")
 
 
-class InfoBlock(FieldSet):
+class DemoBBody(FieldSet):
     def createFields(self) -> None:
         yield UInt32(self, "width")
         yield UInt32(self, "height")
         yield UInt16(self, "depth")
 
 
-class FileParser(Parser):
+class DemoBParser(Parser):
     """Two named sections — flat hierarchy, no repetition."""
 
     endian = LITTLE_ENDIAN
 
     def createFields(self) -> None:
-        yield FileHeader(self, "header")
-        yield InfoBlock(self, "info")
+        yield DemoBHeader(self, "header")
+        yield DemoBBody(self, "info")
 
 
 PARSERS: dict[str, type[Parser]] = {
-    "struct": EntryParser,
-    "file":   FileParser,
+    "demoA": DemoAParser,
+    "demoB": DemoBParser,
 }
 
 
@@ -426,11 +426,12 @@ def _extract_fields(field: Any, path: tuple[str, ...] = ()) -> list[FieldSpan]:
 # ---------------------------------------------------------------------------
 
 
-def field_info(fields: list[FieldSpan]) -> str:
+def field_info(fields: list[FieldSpan], palette: RenderPalette) -> str:
     """Return a human-readable summary.
 
     Group headers are derived from the *path* attribute, so the output
     automatically adapts to whatever hierarchy the parser produces.
+    Field names are coloured with the same background as in the hex dump.
     """
     if not fields:
         return ""
@@ -445,12 +446,18 @@ def field_info(fields: list[FieldSpan]) -> str:
         for i in range(common, len(f.path)):
             indent = "  " * i
             lines.append(f"\n{indent}{f.path[i]}:")
-        last_path = f.path
 
+        last_path = f.path
         indent = "  " * len(f.path)
+        name_str = f"{f.name:12s}"
+        if palette.field_colors:
+            color = palette.field_colors.get(f.name)
+            name_str = f"{RESET}{bg_escape(color)}{name_str}"
+
         val_repr = repr(f.value)
+        suffix = RESET if palette.field_colors else ""
         lines.append(
-            f"{indent}{f.name:12s}  offset={f.offset:#06x}  "
+            f"{indent}{name_str}{suffix}  offset={f.offset:#06x}  "
             f"size={f.size:2d}  value={val_repr}"
         )
     return "\n".join(lines).lstrip("\n")
@@ -596,7 +603,7 @@ def main() -> None:
 
     print(render_xxd(data, fields, palette))
     if args.show_info:
-        info = field_info(fields)
+        info = field_info(fields, palette)
         if info:
             print(info)
 
