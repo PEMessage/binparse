@@ -224,6 +224,14 @@ Color = TrueColor | AnsiColor | AlphaColor | None
 """Possible colour states: truecolour, ANSI index, alpha-blended, or default."""
 
 
+@dataclass
+class FieldSpan:
+    """Byte range of a leaf field, used for index-marker rendering."""
+    idx: int
+    start_byte: int
+    end_byte: int  # exclusive
+
+
 class ColorMode(Enum):
     ALL = "all"
     FG = "fg"
@@ -585,9 +593,15 @@ def render_xxd(
 ) -> str:
     lines: list[str] = []
     cmap = _build_cmap(root, palette, args)
+    field_spans = _build_field_spans(root, args)
+    placed_starts: set[int] = set()
     for offset in range(0, len(data), BYTES_PER_LINE):
         chunk = data[offset : offset + BYTES_PER_LINE]
         lines.append(_render_line(offset, chunk, cmap, palette.char_fg))
+        if args.show_idx:
+            idx_line = _render_index_line(offset, len(chunk), field_spans, placed_starts)
+            if idx_line:
+                lines.append(idx_line)
     return "\n".join(lines)
 
 
@@ -607,6 +621,166 @@ def _build_cmap(
         for p in range(off, off + sz):
             cmap[p] = color
     return cmap
+
+
+def _build_field_spans(
+    root: Field, args: argparse.Namespace,
+) -> list[FieldSpan]:
+    spans: list[FieldSpan] = []
+    for idx, field in _iter_indexed_fields(root, args.show_trailing):
+        if not getattr(field, "is_field_set", False):
+            off = field.absolute_address // 8
+            sz = field.size // 8
+            spans.append(FieldSpan(idx=idx, start_byte=off, end_byte=off + sz))
+    return spans
+
+
+def _hex_byte_start_col(j: int) -> int:
+    """Visual column where byte j's (0-15) hex pair starts in the xxd line."""
+    if j < HALF_LINE:
+        return 10 + j * 3
+    else:
+        return 35 + (j - HALF_LINE) * 3
+
+
+@dataclass
+class _LineEntry:
+    priority: int      # start_byte, for stable sort
+    idx: int
+    has_start: bool
+    has_end: bool
+    start_bl: int      # byte index within line, -1 if none
+    end_bl: int        # byte index within line, -1 if none
+
+
+class _MarkerLine:
+    """Character buffer for one index-marker line below an xxd hex row."""
+
+    PREFIX = 3   # allow left overflow into the ": " gap for right-aligned idx] markers
+    _TOTAL = 80  # hex up to col 57 + 2-col gap before ASCII for right-edge overflow
+
+    def __init__(self, placed_starts: set[int]) -> None:
+        self._chars = [" "] * self._TOTAL
+        self._placed_starts = placed_starts
+
+    # -- public placement API ------------------------------------------------
+
+    def place_both(self, idx_str: str, start_byte: int, end_byte: int, idx: int) -> None:
+        """Field starts *and* ends in this line.  Style-1 then style-2 fallback."""
+        left_col = _hex_byte_start_col(start_byte)
+        right_end_col = _hex_byte_start_col(end_byte) + 1
+        span = right_end_col - left_col + 1
+        ok = self._try_style1(idx_str, left_col, right_end_col) or \
+             self._try_style2(idx_str, left_col, span)
+        if ok:
+            self._placed_starts.add(idx)
+
+    def place_start(self, idx_str: str, start_byte: int, idx: int) -> None:
+        """Field *starts* in this line, ends later."""
+        col = _hex_byte_start_col(start_byte)
+        marker = f"[{idx_str}"
+        if self._free(col, col + len(marker) - 1):
+            self._write(marker, col)
+            self._placed_starts.add(idx)
+
+    def place_end(self, idx_str: str, end_byte: int, idx: int) -> None:
+        """Field *ends* in this line, started earlier.  Suppressed if [ missing."""
+        if idx not in self._placed_starts:
+            return
+        right_end = _hex_byte_start_col(end_byte) + 1
+        marker = f"{idx_str}]"
+        start = right_end - len(marker) + 1
+        if self._free(start, right_end):
+            self._write(marker, start)
+
+    def build(self) -> str | None:
+        s = "".join(self._chars).rstrip()
+        return s if s.strip() else None
+
+    # -- internals -----------------------------------------------------------
+
+    def _try_style1(self, idx_str: str, left_col: int, right_end: int) -> bool:
+        """[idx  …  idx] — two separate pieces."""
+        left = f"[{idx_str}"
+        right = f"{idx_str}]"
+        l_end = left_col + len(left) - 1
+        r_start = right_end - len(right) + 1
+        if l_end >= r_start:
+            return False
+        if not self._free(left_col, l_end):
+            return False
+        if not self._free(r_start, right_end):
+            return False
+        self._write(left, left_col)
+        self._write(right, r_start)
+        return True
+
+    def _try_style2(self, idx_str: str, left_col: int, span: int) -> bool:
+        """[ idx ] — single centred piece."""
+        need = 2 + len(idx_str)
+        if span < need:
+            return False
+        pad = span - need
+        lpad = pad // 2
+        rpad = pad - lpad
+        marker = f"[{' ' * lpad}{idx_str}{' ' * rpad}]"
+        if not self._free(left_col, left_col + len(marker) - 1):
+            return False
+        self._write(marker, left_col)
+        return True
+
+    def _free(self, start: int, end: int) -> bool:
+        return (start >= self.PREFIX and end < self._TOTAL
+                and all(self._chars[c] == " " for c in range(start, end + 1)))
+
+    def _write(self, s: str, start: int) -> None:
+        if start < self.PREFIX or start + len(s) - 1 >= self._TOTAL:
+            return
+        for i, ch in enumerate(s):
+            self._chars[start + i] = ch
+
+
+def _render_index_line(
+    offset: int,
+    nbytes: int,
+    field_spans: list[FieldSpan],
+    placed_starts: set[int],
+) -> str | None:
+    """Render index markers below an xxd hex line.  Returns None if no markers."""
+    line_end = offset + nbytes
+    entries: list[_LineEntry] = []
+
+    for fs in field_spans:
+        if fs.start_byte >= line_end or fs.end_byte <= offset:
+            continue
+        has_start = fs.start_byte >= offset and fs.start_byte < line_end
+        has_end = fs.end_byte > offset and fs.end_byte <= line_end
+        if not has_start and not has_end:
+            continue
+        entries.append(_LineEntry(
+            priority=fs.start_byte,
+            idx=fs.idx,
+            has_start=has_start,
+            has_end=has_end,
+            start_bl=fs.start_byte - offset if has_start else -1,
+            end_bl=(fs.end_byte - 1) - offset if has_end else -1,
+        ))
+
+    if not entries:
+        return None
+    entries.sort(key=lambda e: e.priority)
+
+    ml = _MarkerLine(placed_starts)
+    for e in entries:
+        idx_str = str(e.idx)
+        if e.has_start and e.has_end:
+            ml.place_both(idx_str, e.start_bl, e.end_bl, e.idx)
+        elif e.has_start:
+            ml.place_start(idx_str, e.start_bl, e.idx)
+        elif e.has_end:
+            ml.place_end(idx_str, e.end_bl, e.idx)
+
+    return ml.build()
 
 
 def _render_line(
@@ -694,6 +868,12 @@ def _parse_common_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Print full absolute path for each field (default: false)",
+    )
+    sp_show.add_argument(
+        "--show-idx",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print index markers below hex dump (default: true)",
     )
 
     sp_dump = sub.add_parser("dump", help="Dump raw bytes of a field by index")
