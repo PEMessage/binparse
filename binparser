@@ -496,7 +496,7 @@ def _color_key(name: str) -> str:
     return name[:-2] if name.endswith("[]") else name
 
 
-def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, indent: int) -> str:
+def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, indent: int, show_value: bool) -> str:
     off = field.absolute_address // 8
     sz = field.size // 8
     value = field.value
@@ -504,13 +504,14 @@ def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, i
     display = f"{field.display}"
 
     extra = ""
-    if isinstance(value, bytes):
-        val_repr: str = f"0x{value.hex().upper()}"
-    else:
-        val_repr: str = repr(value)
+    if show_value:
+        if isinstance(value, bytes):
+            val_repr: str = f"0x{value.hex().upper()}"
+        else:
+            val_repr: str = repr(value)
 
-    if val_repr != display:
-        extra += f"value={val_repr}"
+        if val_repr != display:
+            extra += f"value={val_repr}"
 
     name_str = f"{display_name:12s}"
     if palette.field_colors:
@@ -556,18 +557,19 @@ def render_field_info(root: Field, palette: RenderPalette, args: argparse.Namesp
     parts: list[str] = []
     for idx, field in _iter_indexed_fields(root, args.show_trailing):
         indent = _field_depth(field)
+        idx_prefix = f"[{idx:3d}] " if args.show_info_idx else ""
         if getattr(field, "is_field_set", False):
-            display_name = _build_abs_path(field) if args.print_abs_path else field.name
+            display_name = _build_abs_path(field) if args.show_info_abspath else field.name
             off = field.absolute_address // 8
             sz = field.size // 8
-            parts.append(f"[{idx:3d}] {'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
+            parts.append(f"{idx_prefix}{'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
         else:
             name = field.name
-            if not args.print_abs_path and name.endswith("[]"):
+            if not args.show_info_abspath and name.endswith("[]"):
                 name = name[:-2]
-            display_name = _build_abs_path(field) if args.print_abs_path else name
-            line = _format_leaf_line(field, display_name, palette, indent)
-            parts.append(f"[{idx:3d}] {line}")
+            display_name = _build_abs_path(field) if args.show_info_abspath else name
+            line = _format_leaf_line(field, display_name, palette, indent, args.show_info_value)
+            parts.append(f"{idx_prefix}{line}")
     return "\n".join(parts)
 
 
@@ -602,7 +604,7 @@ def render_xxd(
     for offset in range(0, len(data), BYTES_PER_LINE):
         chunk = data[offset : offset + BYTES_PER_LINE]
         lines.append(_render_line(offset, chunk, cmap, palette.char_fg))
-        if args.show_idx:
+        if args.show_xxd_idx:
             idx_line = _render_index_line(offset, len(chunk), field_spans, placed_starts)
             if idx_line:
                 lines.append(idx_line)
@@ -856,28 +858,46 @@ def _parse_common_args() -> argparse.Namespace:
         help="Colouring: all (default), fg (foreground only), bg (background only), none",
     )
     sp_show.add_argument(
+        "--show-xxd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print hex dump (default: true)",
+    )
+    sp_show.add_argument(
+        "--show-xxd-idx",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print index markers below hex dump (default: true)",
+    )
+    sp_show.add_argument(
         "--show-info",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Print field summary after the hex dump (default: true)",
     )
     sp_show.add_argument(
-        "--show-trailing",
+        "--show-info-idx",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Include trailing raw/padding autofix fields (default: false)",
+        default=True,
+        help="Print field index numbers in field info (default: true)",
     )
     sp_show.add_argument(
-        "--print-abs-path",
+        "--show-info-value",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show extra value field in field info (default: true)",
+    )
+    sp_show.add_argument(
+        "--show-info-abspath",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Print full absolute path for each field (default: false)",
     )
     sp_show.add_argument(
-        "--show-idx",
+        "--show-trailing",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Print index markers below hex dump (default: true)",
+        default=False,
+        help="Include trailing raw/padding autofix fields (default: false)",
     )
 
     sp_dump = sub.add_parser("dump", help="Dump raw bytes of a field by index")
@@ -969,7 +989,8 @@ def cmd_show(args: argparse.Namespace, data: bytes, root: Field) -> None:
         char_fg = char_color if color_mode.use_fg else None,
     )
 
-    print(render_xxd(data, root, palette, args))
+    if args.show_xxd:
+        print(render_xxd(data, root, palette, args))
     if args.show_info:
         info = render_field_info(root, palette, args)
         if info:
