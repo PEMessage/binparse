@@ -75,16 +75,6 @@ class DemoA(FieldSet):
         yield RawBytes(self, "reserved", 3)
 
 
-class DemoAParser(Parser):
-    """Repeated fixed-size DemoA records."""
-
-    endian = LITTLE_ENDIAN
-
-    def createFields(self) -> GeneratorType:
-        while not self.eof:
-            yield DemoA(self, "entry[]")
-
-
 # --- Second parser: demonstrates nested containers (no repeated entries) ---
 
 
@@ -102,7 +92,7 @@ class DemoBBody(FieldSet):
         yield UInt16(self, "depth")
 
 
-class DemoBParser(Parser):
+class DemoB(FieldSet):
     """Two named sections — flat hierarchy, no repetition."""
 
     endian = LITTLE_ENDIAN
@@ -187,8 +177,11 @@ class ASN1TLVParser(Parser):
 PARSERS: dict[str, type[Parser]] = {
     "asn1tlv":  ASN1TLVParser,
     "asn1": asn1.ASN1File,
-    "demoA": DemoAParser,
-    "demoB": DemoBParser,
+}
+
+FIELDS: dict[str, type[Field]] = {
+    "demoA": DemoA,
+    "demoB": DemoB,
 }
 
 
@@ -907,9 +900,16 @@ def _add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "-s",
         "--struct",
-        choices=list(PARSERS),
+        choices=list(PARSERS) + list(FIELDS),
         required=True,
         help="Parser to use (%(choices)s)",
+    )
+    ap.add_argument(
+        "-l",
+        "--list",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="List Parse",
     )
     ap.add_argument(
         "--offset",
@@ -934,8 +934,24 @@ def _load_data(args: argparse.Namespace) -> bytes:
     return data
 
 
+def _create_parser(args: argparse.Namespace, field: Field) -> Parser:
+    class WrapperParser(Parser):
+        endian = LITTLE_ENDIAN
+        def createFields(self) -> GeneratorType:
+            if not args.list:
+                yield field(self, "root")
+            else:
+                while not self.eof:
+                    yield field(self, "root[]")
+
+    return WrapperParser
+
+
 def _parse_root(args: argparse.Namespace, data: bytes) -> Field:
-    parser_cls = PARSERS[args.struct]
+    if args.struct in FIELDS:
+        parser_cls = _create_parser(args, FIELDS[args.struct])
+    else:
+        parser_cls = PARSERS[args.struct]
     stream = StringInputStream(data)
     parser = parser_cls(stream)
     root = parser["/"]

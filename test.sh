@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PARSER="$SCRIPT_DIR/binparser"
 
 echo "=== 1. demoA ==="
-"$SCRIPT_DIR/test/gen_demoA.py" -n 2 | uv run --script "$PARSER" -s demoA show -c none
+"$SCRIPT_DIR/test/gen_demoA.py" -n 2 | uv run --script "$PARSER" -s demoA -l show -c none
 
 echo ""
 echo "=== 2. demoB ==="
@@ -13,19 +13,19 @@ echo "=== 2. demoB ==="
 
 echo ""
 echo "=== 3. asn1 ==="
-"$SCRIPT_DIR/test/gen_asn1.py" | uv run --script "$PARSER" -s asn1 show -c none
+"$SCRIPT_DIR/test/gen_asn1.py" | uv run --script "$PARSER" -s asn1tlv show -c none
 
 echo ""
 echo "=== 4. asn1 --no-show-info ==="
-"$SCRIPT_DIR/test/gen_asn1.py" | uv run --script "$PARSER" -s asn1 show --no-show-info -c none
+"$SCRIPT_DIR/test/gen_asn1.py" | uv run --script "$PARSER" -s asn1tlv show --no-show-info -c none
 
 echo ""
 echo "=== 5. asn1 cross-parser: demoA data → asn1 parser ==="
-"$SCRIPT_DIR/test/gen_demoA.py" -n 1 | uv run --script "$PARSER" -s asn1 show -c none
+"$SCRIPT_DIR/test/gen_demoA.py" -n 1 | uv run --script "$PARSER" -s asn1tlv show -c none
 
 echo ""
 echo "=== 6. asn1 --show-trailing ==="
-"$SCRIPT_DIR/test/gen_demoA.py" -n 1 | uv run --script "$PARSER" -s asn1 show --show-trailing -c none | tail -3
+"$SCRIPT_DIR/test/gen_demoA.py" -n 1 | uv run --script "$PARSER" -s asn1tlv show --show-trailing -c none | tail -3
 
 echo ""
 echo "=== All tests passed ==="
