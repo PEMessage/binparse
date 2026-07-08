@@ -26,6 +26,8 @@ as raw (un-highlighted).
 """
 
 from __future__ import annotations
+import types
+from types import GeneratorType
 
 import argparse
 import os
@@ -39,7 +41,7 @@ from enum import Enum
 from functools import cache
 from typing import Any
 
-from hachoir.core.endian import LITTLE_ENDIAN
+from hachoir.core.endian import BIG_ENDIAN, LITTLE_ENDIAN
 from hachoir.core.log import log as _hachoir_log
 from hachoir.field import FieldSet, RawBytes, UInt8, UInt16, UInt32
 from hachoir.parser import Parser
@@ -64,7 +66,7 @@ HALF_LINE = BYTES_PER_LINE // 2
 class DemoA(FieldSet):
     """One 16-byte record."""
 
-    def createFields(self) -> None:
+    def createFields(self) -> GeneratorType:
         yield UInt32(self, "id")
         yield UInt32(self, "timestamp")
         yield UInt16(self, "type")
@@ -78,7 +80,7 @@ class DemoAParser(Parser):
 
     endian = LITTLE_ENDIAN
 
-    def createFields(self) -> None:
+    def createFields(self) -> GeneratorType:
         while not self.eof:
             yield DemoA(self, "entry[]")
 
@@ -87,14 +89,14 @@ class DemoAParser(Parser):
 
 
 class DemoBHeader(FieldSet):
-    def createFields(self) -> None:
+    def createFields(self) -> GeneratorType:
         yield UInt32(self, "magic")
         yield UInt16(self, "version")
         yield UInt16(self, "flags")
 
 
 class DemoBBody(FieldSet):
-    def createFields(self) -> None:
+    def createFields(self) -> GeneratorType:
         yield UInt32(self, "width")
         yield UInt32(self, "height")
         yield UInt16(self, "depth")
@@ -105,14 +107,73 @@ class DemoBParser(Parser):
 
     endian = LITTLE_ENDIAN
 
-    def createFields(self) -> None:
+    def createFields(self) -> GeneratorType:
         yield DemoBHeader(self, "header")
         yield DemoBBody(self, "info")
+
+
+# --- Third parser: ASN.1 BER/DER (TLV with variable-length tag & length) ---
+
+
+class ASN1TLV(FieldSet):
+    """One ASN.1 TLV record.
+
+    Uses ``stream.readBytes`` to peek at the leading tag / length bytes
+    so that a single consolidated ``RawBytes`` field is yielded for each
+    logical component, regardless of how many bytes the encoding occupies.
+    """
+
+    def createFields(self) -> GeneratorType:
+        # --- Tag (1 byte, possibly extended) ---
+        bit_pos = self.absolute_address + self.current_size
+        tag0 = self.stream.readBytes(bit_pos, 1)[0]
+
+        if (tag0 & 0x1F) != 0x1F:
+            tag_size = 1
+        else:
+            tag_size = 1
+            while True:
+                b = self.stream.readBytes(bit_pos + tag_size * 8, 1)[0]
+                tag_size += 1
+                if not (b & 0x80):
+                    break
+        yield RawBytes(self, "tag", tag_size)
+
+        # --- Length (short-form 1 B, or long-form 1 + N B) ---
+        bit_pos = self.absolute_address + self.current_size
+        len0 = self.stream.readBytes(bit_pos, 1)[0]
+
+        if not (len0 & 0x80):
+            total, len_size = len0, 1
+        else:
+            num = len0 & 0x7F
+            len_size = 1 + num
+            total = 0
+            for i in range(num):
+                total = (total << 8) | self.stream.readBytes(
+                    bit_pos + (1 + i) * 8, 1
+                )[0]
+        yield RawBytes(self, "length", len_size)
+
+        # --- Value ---
+        if total > 0:
+            yield RawBytes(self, "value", total)
+
+
+class ASN1Parser(Parser):
+    """Stream of ASN.1 BER/DER TLV records — big-endian."""
+
+    endian = BIG_ENDIAN
+
+    def createFields(self) -> GeneratorType:
+        while not self.eof:
+            yield ASN1TLV(self, "tlv[]")
 
 
 PARSERS: dict[str, type[Parser]] = {
     "demoA": DemoAParser,
     "demoB": DemoBParser,
+    "asn1":  ASN1Parser,
 }
 
 
@@ -406,9 +467,7 @@ def parse(data: bytes, parser_cls: type[Parser]) -> list[FieldSpan]:
 
 def _extract_fields(field: Any, path: tuple[str, ...] = ()) -> list[FieldSpan]:
     spans: list[FieldSpan] = []
-    if hasattr(field, "__iter__") and not isinstance(
-        field, (UInt32, UInt16, UInt8, RawBytes)
-    ):
+    if getattr(field, "is_field_set", False):
         parent = getattr(field, "parent", None)
         child_path = path + (field.name,) if parent is not None else path
         for sub in field:
@@ -416,7 +475,9 @@ def _extract_fields(field: Any, path: tuple[str, ...] = ()) -> list[FieldSpan]:
     else:
         abs_addr = field.absolute_address // 8
         size = field.size // 8
-        name = field.name.rstrip("[]")
+        name = field.name
+        if name.endswith("[]"):
+            name = name[:-2]
         spans.append(FieldSpan(name, abs_addr, size, field.value, path))
     return spans
 
