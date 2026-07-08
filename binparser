@@ -650,11 +650,28 @@ def main() -> None:
         default=False,
         help="Include trailing raw/padding autofix fields (default: false)",
     )
+    ap.add_argument(
+        "--offset",
+        type=lambda v: int(v, 0),
+        default=0,
+        help="Skip this many bytes from the start of input (default: 0)",
+    )
+    ap.add_argument(
+        "--limit",
+        type=lambda v: int(v, 0),
+        default=None,
+        help="Process at most this many bytes (default: whole input)",
+    )
     args = ap.parse_args()
 
     data = sys.stdin.buffer.read()
     if not data:
         return
+
+    if args.offset or args.limit is not None:
+        start = args.offset
+        end = start + args.limit if args.limit is not None else len(data)
+        data = data[start:end]
 
     parser_cls = PARSERS[args.struct]
     color_mode = ColorMode(args.color)
