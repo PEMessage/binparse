@@ -115,6 +115,17 @@ class DemoBParser(Parser):
 # --- Third parser: ASN.1 BER/DER (TLV with variable-length tag & length) ---
 
 
+class RawInt(RawBytes):
+    """Like RawBytes but stores an explicit integer value."""
+
+    def __init__(self, parent, name, length, value=None, description="Raw data"):
+        super().__init__(parent, name, length, description)
+        self._rawint_value = value
+
+    def createValue(self):
+        return self._rawint_value
+
+
 class ASN1TLV(FieldSet):
     """One ASN.1 TLV record.
 
@@ -153,7 +164,7 @@ class ASN1TLV(FieldSet):
                 total = (total << 8) | self.stream.readBytes(
                     bit_pos + (1 + i) * 8, 1
                 )[0]
-        yield RawBytes(self, "length", len_size)
+        yield RawInt(self, "length", len_size, value=total)
 
         # --- Value ---
         if total > 0:
@@ -446,6 +457,7 @@ class FieldSpan:
     offset: int
     size: int
     value: Any
+    type_name: str = ""
     path: tuple[str, ...] = ()
 
     @property
@@ -478,7 +490,11 @@ def _extract_fields(field: Any, path: tuple[str, ...] = ()) -> list[FieldSpan]:
         name = field.name
         if name.endswith("[]"):
             name = name[:-2]
-        spans.append(FieldSpan(name, abs_addr, size, field.value, path))
+        spans.append(FieldSpan(
+            name, abs_addr, size, field.value,
+            type_name=type(field.value).__name__,
+            path=path,
+        ))
     return spans
 
 
@@ -515,11 +531,14 @@ def field_info(fields: list[FieldSpan], palette: RenderPalette) -> str:
             color = palette.field_colors.get(f.name)
             name_str = f"{RESET}{bg_escape(color)}{name_str}"
 
-        val_repr = repr(f.value)
+        if isinstance(f.value, bytes):
+            val_repr = f"0x{f.value.hex().upper()}"
+        else:
+            val_repr = repr(f.value)
         suffix = RESET if palette.field_colors else ""
         lines.append(
             f"{indent}{name_str}{suffix}  offset={f.offset:#06x}  "
-            f"size={f.size:2d}  value={val_repr}"
+            f"size={f.size:2d}  type={f.type_name:<5s}  value={val_repr}"
         )
     return "\n".join(lines).lstrip("\n")
 
