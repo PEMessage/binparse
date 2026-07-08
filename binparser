@@ -506,14 +506,23 @@ def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, i
     sz = field.size // 8
     value = field.value
     type_name = type(value).__name__
-    val_repr = f"0x{value.hex().upper()}" if isinstance(value, bytes) else repr(value)
+    display = f"{field.display}"
+
+    extra = ""
+    if isinstance(value, bytes):
+        val_repr: str = f"0x{value.hex().upper()}"
+    else:
+        val_repr: str = repr(value)
+
+    if val_repr != display:
+        extra += f"value={val_repr}"
 
     name_str = f"{display_name:12s}"
     if palette.field_colors:
         color = palette.field_colors.get(_color_key(field.name))
         name_str = f"{RESET}{bg_escape(color)}{name_str}"
     suffix = RESET if palette.field_colors else ""
-    return f"{'  ' * indent}{name_str}{suffix}  offset={off:#06x}  size={sz:2d}  type={type_name:<5s}  value={val_repr}"
+    return f"{'  ' * indent}{name_str}{suffix}  offset={off:#06x}  size={sz:<4d}  type={type_name:<5s}  display={display:<10s}  {extra}"
 
 
 def _field_depth(field: Field) -> int:
