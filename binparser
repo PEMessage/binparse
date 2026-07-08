@@ -505,40 +505,54 @@ def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, i
     return f"{'  ' * indent}{name_str}{suffix}  offset={off:#06x}  size={sz:2d}  type={type_name:<5s}  value={val_repr}"
 
 
-def render_field_info(
-    field: Field, palette: RenderPalette, args: argparse.Namespace, indent: int = 0,
-    _counter: list[int] | None = None,
-) -> str:
-    if _counter is None:
-        _counter = [0]
+def _field_depth(field: Field) -> int:
+    depth = 0
+    current = field
+    while current.parent is not None:
+        depth += 1
+        current = current.parent
+    return depth - 1
+
+
+def _iter_indexed_fields(root: Field, show_trailing: bool = False) -> GeneratorType:
+    """Yield (idx, field) in DFS pre-order (root excluded)."""
+    counter = [0]
+
+    def _walk(f: Field) -> GeneratorType:
+        if getattr(f, "is_field_set", False):
+            is_root = f.parent is None
+            if not is_root:
+                idx = counter[0]
+                counter[0] += 1
+                yield idx, f
+            for sub in f:
+                yield from _walk(sub)
+        else:
+            if not show_trailing and _is_autofix_field(f.name):
+                return
+            idx = counter[0]
+            counter[0] += 1
+            yield idx, f
+
+    yield from _walk(root)
+
+
+def render_field_info(root: Field, palette: RenderPalette, args: argparse.Namespace) -> str:
     parts: list[str] = []
-    if getattr(field, "is_field_set", False):
-        is_root = field.parent is None
-        if not is_root:
-            idx = _counter[0]
-            _counter[0] += 1
+    for idx, field in _iter_indexed_fields(root, args.show_trailing):
+        indent = _field_depth(field)
+        if getattr(field, "is_field_set", False):
             display_name = _build_abs_path(field) if args.print_abs_path else field.name
             off = field.absolute_address // 8
             sz = field.size // 8
             parts.append(f"[{idx:3d}] {'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
-            next_indent = indent + 1
         else:
-            next_indent = indent
-        for sub in field:
-            sub_part = render_field_info(sub, palette, args, next_indent, _counter)
-            if sub_part:
-                parts.append(sub_part)
-    else:
-        if not args.show_trailing and _is_autofix_field(field.name):
-            return ""
-        idx = _counter[0]
-        _counter[0] += 1
-        name = field.name
-        if not args.print_abs_path and name.endswith("[]"):
-            name = name[:-2]
-        display_name = _build_abs_path(field) if args.print_abs_path else name
-        line = _format_leaf_line(field, display_name, palette, indent)
-        parts.append(f"[{idx:3d}] {line}")
+            name = field.name
+            if not args.print_abs_path and name.endswith("[]"):
+                name = name[:-2]
+            display_name = _build_abs_path(field) if args.print_abs_path else name
+            line = _format_leaf_line(field, display_name, palette, indent)
+            parts.append(f"[{idx:3d}] {line}")
     return "\n".join(parts)
 
 
@@ -645,35 +659,65 @@ def _ascii_cell(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def _parse_common_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Binary struct parser — xxd-style output with ANSI colours"
     )
-    ap.add_argument(
-        "-s",
-        "--struct",
-        choices=list(PARSERS),
-        required=True,
-        help="Parser to use (%(choices)s)",
-    )
-    ap.add_argument(
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp_show = sub.add_parser("show", help="Render xxd-style hex dump with field info")
+    _add_common_args(sp_show)
+    sp_show.add_argument(
         "-c",
         "--color",
         choices=[m.value for m in ColorMode],
         default=ColorMode.ALL.value,
         help="Colouring: all (default), fg (foreground only), bg (background only), none",
     )
-    ap.add_argument(
+    sp_show.add_argument(
         "--show-info",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Print field summary after the hex dump (default: true)",
     )
-    ap.add_argument(
+    sp_show.add_argument(
         "--show-trailing",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Include trailing raw/padding autofix fields (default: false)",
+    )
+    sp_show.add_argument(
+        "--print-abs-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print full absolute path for each field (default: false)",
+    )
+
+    sp_dump = sub.add_parser("dump", help="Dump raw bytes of a field by index")
+    _add_common_args(sp_dump)
+    sp_dump.add_argument(
+        "--index",
+        type=int,
+        required=True,
+        help="Field index to dump",
+    )
+    sp_dump.add_argument(
+        "--show-trailing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include trailing raw/padding autofix fields in indexing (default: false)",
+    )
+
+    return ap.parse_args()
+
+
+def _add_common_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "-s",
+        "--struct",
+        choices=list(PARSERS),
+        required=True,
+        help="Parser to use (%(choices)s)",
     )
     ap.add_argument(
         "--offset",
@@ -687,31 +731,28 @@ def main() -> None:
         default=None,
         help="Process at most this many bytes (default: whole input)",
     )
-    ap.add_argument(
-        "--print-abs-path",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Print full absolute path for each field (default: false)",
-    )
-    args = ap.parse_args()
 
+
+def _load_data(args: argparse.Namespace) -> bytes:
     data = sys.stdin.buffer.read()
-    if not data:
-        return
-
     if args.offset or args.limit is not None:
         start = args.offset
         end = start + args.limit if args.limit is not None else len(data)
         data = data[start:end]
+    return data
 
+
+def _parse_root(args: argparse.Namespace, data: bytes) -> Field:
     parser_cls = PARSERS[args.struct]
-    color_mode = ColorMode(args.color)
-
     stream = StringInputStream(data)
     parser = parser_cls(stream)
     root = parser["/"]
-
     assert isinstance(root, Field)
+    return root
+
+
+def cmd_show(args: argparse.Namespace, data: bytes, root: Field) -> None:
+    color_mode = ColorMode(args.color)
 
     unique_names = list(dict.fromkeys(_collect_leaf_names(root)))
     field_colors: dict[str, Color] = auto_colors(unique_names) if color_mode.use_bg else {}
@@ -726,6 +767,30 @@ def main() -> None:
         info = render_field_info(root, palette, args)
         if info:
             print(info)
+
+
+def cmd_dump(args: argparse.Namespace, data: bytes, root: Field) -> None:
+    for idx, field in _iter_indexed_fields(root, args.show_trailing):
+        if idx == args.index:
+            offset = field.absolute_address // 8
+            size = field.size // 8
+            sys.stdout.buffer.write(data[offset:offset + size])
+            return
+    print(f"error: index {args.index} not found", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> None:
+    args = _parse_common_args()
+    data = _load_data(args)
+    if not data:
+        return
+    root = _parse_root(args, data)
+
+    if args.cmd == "show":
+        cmd_show(args, data, root)
+    elif args.cmd == "dump":
+        cmd_dump(args, data, root)
 
 
 if __name__ == "__main__":
