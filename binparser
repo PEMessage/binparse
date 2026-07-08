@@ -45,6 +45,7 @@ from hachoir.core.log import log as _hachoir_log
 from hachoir.field import Field, FieldSet, RawBytes, UInt8, UInt16, UInt32
 from hachoir.parser import Parser
 from hachoir.stream import StringInputStream
+from hachoir.parser.container import asn1
 
 _hachoir_log.use_print = False
 
@@ -173,20 +174,21 @@ class ASN1TLV(FieldSet):
             yield RawBytes(self, "value", total)
 
 
-class ASN1Parser(Parser):
+class ASN1TLVParser(Parser):
     """Stream of ASN.1 BER/DER TLV records — big-endian."""
 
     endian = BIG_ENDIAN
 
     def createFields(self) -> GeneratorType:
         while not self.eof:
-            yield ASN1TLV(self, "tlv[]")
+            yield asn1.Object(self, "tlv[]")
 
 
 PARSERS: dict[str, type[Parser]] = {
+    "asn1tlv":  ASN1TLVParser,
+    "asn1": asn1.ASN1File,
     "demoA": DemoAParser,
     "demoB": DemoBParser,
-    "asn1":  ASN1Parser,
 }
 
 
