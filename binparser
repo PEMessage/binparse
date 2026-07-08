@@ -46,6 +46,7 @@ from hachoir.field import Field, FieldSet, RawBytes, UInt8, UInt16, UInt32
 from hachoir.parser import Parser
 from hachoir.stream import StringInputStream
 from hachoir.parser.container import asn1
+from hachoir.parser.program import elf
 
 _hachoir_log.use_print = False
 
@@ -177,6 +178,7 @@ class ASN1TLVParser(Parser):
 PARSERS: dict[str, type[Parser]] = {
     "asn1tlv":  ASN1TLVParser,
     "asn1": asn1.ASN1File,
+    "elf": elf.ElfFile,
 }
 
 FIELDS: dict[str, type[Field]] = {
