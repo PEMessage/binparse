@@ -666,10 +666,10 @@ def _parse_common_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Binary struct parser — xxd-style output with ANSI colours"
     )
+    _add_common_args(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp_show = sub.add_parser("show", help="Render xxd-style hex dump with field info")
-    _add_common_args(sp_show)
     sp_show.add_argument(
         "-c",
         "--color",
@@ -697,7 +697,6 @@ def _parse_common_args() -> argparse.Namespace:
     )
 
     sp_dump = sub.add_parser("dump", help="Dump raw bytes of a field by index")
-    _add_common_args(sp_dump)
     sp_dump.add_argument(
         "index",
         type=int,
