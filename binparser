@@ -485,44 +485,60 @@ def _trailing_ids(root: Any) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
+def _color_key(name: str) -> str:
+    return name[:-2] if name.endswith("[]") else name
+
+
+def _path_join(path_prefix: str, name: str, print_abs_path: bool) -> str:
+    if print_abs_path and path_prefix:
+        return f"{path_prefix}/{name}"
+    return name
+
+
+def _format_leaf_line(field: Any, display_name: str, palette: RenderPalette, indent: int) -> str:
+    off = field.absolute_address // 8
+    sz = field.size // 8
+    value = field.value
+    type_name = type(value).__name__
+    val_repr = f"0x{value.hex().upper()}" if isinstance(value, bytes) else repr(value)
+
+    name_str = f"{display_name:12s}"
+    if palette.field_colors:
+        color = palette.field_colors.get(_color_key(field.name))
+        name_str = f"{RESET}{bg_escape(color)}{name_str}"
+    suffix = RESET if palette.field_colors else ""
+    return f"{'  ' * indent}{name_str}{suffix}  offset={off:#06x}  size={sz:2d}  type={type_name:<5s}  value={val_repr}"
+
+
 def render_field_info(
-    field: Any, palette: RenderPalette, skip_ids: set[int] | None = None, indent: int = 0
+    field: Any, palette: RenderPalette, skip_ids: set[int] | None = None, indent: int = 0,
+    print_abs_path: bool = False, path_prefix: str = "",
 ) -> str:
     parts: list[str] = []
     if getattr(field, "is_field_set", False):
         is_root = getattr(field, "parent", None) is None
         if not is_root:
+            display_name = _path_join(path_prefix, field.name, print_abs_path)
             off = field.absolute_address // 8
             sz = field.size // 8
-            parts.append(f"{'  ' * indent}{field.name}:  offset={off:#06x}  size={sz:2d}")
-        next_indent = indent if is_root else indent + 1
+            parts.append(f"{'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
+            next_indent = indent + 1
+            next_prefix = display_name
+        else:
+            next_indent = indent
+            next_prefix = path_prefix
         for sub in field:
-            sub_part = render_field_info(sub, palette, skip_ids, next_indent)
+            sub_part = render_field_info(sub, palette, skip_ids, next_indent, print_abs_path, next_prefix)
             if sub_part:
                 parts.append(sub_part)
     else:
         if skip_ids and id(field) in skip_ids:
             return ""
         name = field.name
-        if name.endswith("[]"):
+        if not print_abs_path and name.endswith("[]"):
             name = name[:-2]
-        off = field.absolute_address // 8
-        sz = field.size // 8
-        value = field.value
-        type_name = type(value).__name__
-        if isinstance(value, bytes):
-            val_repr = f"0x{value.hex().upper()}"
-        else:
-            val_repr = repr(value)
-        name_str = f"{name:12s}"
-        if palette.field_colors:
-            color = palette.field_colors.get(name)
-            name_str = f"{RESET}{bg_escape(color)}{name_str}"
-        suffix = RESET if palette.field_colors else ""
-        parts.append(
-            f"{'  ' * indent}{name_str}{suffix}  offset={off:#06x}  "
-            f"size={sz:2d}  type={type_name:<5s}  value={val_repr}"
-        )
+        display_name = _path_join(path_prefix, name, print_abs_path)
+        parts.append(_format_leaf_line(field, display_name, palette, indent))
     return "\n".join(parts)
 
 
@@ -671,6 +687,12 @@ def main() -> None:
         default=None,
         help="Process at most this many bytes (default: whole input)",
     )
+    ap.add_argument(
+        "--print-abs-path",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print full absolute path for each field (default: false)",
+    )
     args = ap.parse_args()
 
     data = sys.stdin.buffer.read()
@@ -701,7 +723,7 @@ def main() -> None:
 
     print(render_xxd(data, root, palette, skip_ids))
     if args.show_info:
-        info = render_field_info(root, palette, skip_ids)
+        info = render_field_info(root, palette, skip_ids, print_abs_path=args.print_abs_path)
         if info:
             print(info)
 
