@@ -39,11 +39,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
-from typing import Any
 
 from hachoir.core.endian import BIG_ENDIAN, LITTLE_ENDIAN
 from hachoir.core.log import log as _hachoir_log
-from hachoir.field import FieldSet, RawBytes, UInt8, UInt16, UInt32
+from hachoir.field import Field, FieldSet, RawBytes, UInt8, UInt16, UInt32
 from hachoir.parser import Parser
 from hachoir.stream import StringInputStream
 
@@ -363,14 +362,14 @@ def auto_colors(
     saturation: float = 0.7,
     lightness: float = 0.7,
     alpha: float = 0.20,
-) -> dict[str, AlphaColor]:
+) -> dict[str, Color]:
     """Generate visually distinct background colours for *names*.
 
     Hues are distributed using the golden-ratio conjugate so that any
     number of fields get evenly-spaced, distinguishable colours.
     Stable across calls: same *names* in the same order → same result.
     """
-    colors: dict[str, AlphaColor] = {}
+    colors: dict[str, Color] = {}
     hue = 0.0
     for name in names:
         r, g, b = _hsl_to_rgb(hue, saturation, lightness)
@@ -444,7 +443,7 @@ def fg_escape(c: Color) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _walk_leaves(field: Any, path: tuple[str, ...] = ()) -> GeneratorType:
+def _walk_leaves(field: Field, path: tuple[str, ...] = ()) -> GeneratorType:
     if getattr(field, "is_field_set", False):
         parent = getattr(field, "parent", None)
         child_path = path + (field.name,) if parent is not None else path
@@ -454,7 +453,7 @@ def _walk_leaves(field: Any, path: tuple[str, ...] = ()) -> GeneratorType:
         yield field, path
 
 
-def _collect_leaf_names(root: Any) -> list[str]:
+def _collect_leaf_names(root: Field) -> list[str]:
     names: list[str] = []
     for field, _path in _walk_leaves(root):
         name = field.name
@@ -464,7 +463,7 @@ def _collect_leaf_names(root: Any) -> list[str]:
     return names
 
 
-def _trailing_ids(root: Any) -> set[int]:
+def _trailing_ids(root: Field) -> set[int]:
     leaves = list(_walk_leaves(root))
     skip: set[int] = set()
     while leaves:
@@ -485,17 +484,23 @@ def _trailing_ids(root: Any) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
+def _build_abs_path(field: Field) -> str:
+    parts: list[str] = []
+    current: Field | None = field
+    while current is not None:
+        parent = current.parent
+        if parent is None:
+            break
+        parts.append(current.name)
+        current = parent
+    return "/".join(reversed(parts))
+
+
 def _color_key(name: str) -> str:
     return name[:-2] if name.endswith("[]") else name
 
 
-def _path_join(path_prefix: str, name: str, print_abs_path: bool) -> str:
-    if print_abs_path and path_prefix:
-        return f"{path_prefix}/{name}"
-    return name
-
-
-def _format_leaf_line(field: Any, display_name: str, palette: RenderPalette, indent: int) -> str:
+def _format_leaf_line(field: Field, display_name: str, palette: RenderPalette, indent: int) -> str:
     off = field.absolute_address // 8
     sz = field.size // 8
     value = field.value
@@ -511,24 +516,22 @@ def _format_leaf_line(field: Any, display_name: str, palette: RenderPalette, ind
 
 
 def render_field_info(
-    field: Any, palette: RenderPalette, skip_ids: set[int] | None = None, indent: int = 0,
-    print_abs_path: bool = False, path_prefix: str = "",
+    field: Field, palette: RenderPalette, skip_ids: set[int] | None = None, indent: int = 0,
+    print_abs_path: bool = False,
 ) -> str:
     parts: list[str] = []
     if getattr(field, "is_field_set", False):
-        is_root = getattr(field, "parent", None) is None
+        is_root = field.parent is None
         if not is_root:
-            display_name = _path_join(path_prefix, field.name, print_abs_path)
+            display_name = _build_abs_path(field) if print_abs_path else field.name
             off = field.absolute_address // 8
             sz = field.size // 8
             parts.append(f"{'  ' * indent}{display_name}:  offset={off:#06x}  size={sz:2d}")
             next_indent = indent + 1
-            next_prefix = display_name
         else:
             next_indent = indent
-            next_prefix = path_prefix
         for sub in field:
-            sub_part = render_field_info(sub, palette, skip_ids, next_indent, print_abs_path, next_prefix)
+            sub_part = render_field_info(sub, palette, skip_ids, next_indent, print_abs_path)
             if sub_part:
                 parts.append(sub_part)
     else:
@@ -537,7 +540,7 @@ def render_field_info(
         name = field.name
         if not print_abs_path and name.endswith("[]"):
             name = name[:-2]
-        display_name = _path_join(path_prefix, name, print_abs_path)
+        display_name = _build_abs_path(field) if print_abs_path else name
         parts.append(_format_leaf_line(field, display_name, palette, indent))
     return "\n".join(parts)
 
@@ -564,7 +567,7 @@ class RenderPalette:
 
 
 def render_xxd(
-    data: bytes, root: Any, palette: RenderPalette, skip_ids: set[int] | None = None
+    data: bytes, root: Field, palette: RenderPalette, skip_ids: set[int] | None = None
 ) -> str:
     lines: list[str] = []
     cmap = _build_cmap(root, palette, skip_ids)
@@ -575,7 +578,7 @@ def render_xxd(
 
 
 def _build_cmap(
-    root: Any, palette: RenderPalette, skip_ids: set[int] | None = None
+    root: Field, palette: RenderPalette, skip_ids: set[int] | None = None
 ) -> dict[int, Color]:
     cmap: dict[int, Color] = {}
     for field, _path in _walk_leaves(root):
@@ -711,10 +714,12 @@ def main() -> None:
     parser = parser_cls(stream)
     root = parser["/"]
 
+    assert isinstance(root, Field)
+
     skip_ids = set() if args.show_trailing else _trailing_ids(root)
 
     unique_names = list(dict.fromkeys(_collect_leaf_names(root)))
-    field_colors = auto_colors(unique_names) if color_mode.use_bg else {}
+    field_colors: dict[str, Color] = auto_colors(unique_names) if color_mode.use_bg else {}
 
     palette = RenderPalette(
         field_colors=field_colors,
