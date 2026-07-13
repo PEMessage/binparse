@@ -332,9 +332,9 @@ class TR31OptionalBlock(FieldSet):
             yield ComputedBytes(
                 self, "length_ext", 2, value=num, description="Extended length size"
             )
-            total = int(self._peek(0, num), 16)
-            yield String(self, "length_value", num, charset="ASCII")
-            data_len = total - 4 - num
+            total = int(self._peek(0, num * 2), 16)
+            yield String(self, "length_value", num * 2, charset="ASCII")
+            data_len = total - 6 - (num * 2)
         else:
             total = int(len_field, 16)
             yield ComputedBytes(
