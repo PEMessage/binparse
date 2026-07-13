@@ -42,7 +42,7 @@ from functools import cache
 
 from hachoir.core.endian import BIG_ENDIAN, LITTLE_ENDIAN
 from hachoir.core.log import log as _hachoir_log
-from hachoir.field import Field, FieldSet, RawBytes, UInt8, UInt16, UInt32
+from hachoir.field import Field, FieldSet, RawBytes, String, UInt8, UInt16, UInt32
 from hachoir.parser import Parser
 from hachoir.stream import StringInputStream
 from hachoir.parser.container import asn1
@@ -175,10 +175,100 @@ class ASN1TLVParser(Parser):
             yield asn1.Object(self, "tlv[]")
 
 
+# --- Fourth parser: TR-31 / X9.143 key block (ASCII header + hex payload) ---
+
+
+# Authenticator length in bytes, keyed by the leading version_id character.
+_TR31_MAC_BYTES: dict[str, int] = {
+    "A": 4,   # TR-31:2005, TDES Variant, CBC-MAC
+    "B": 8,   # TR-31:2010, TDES Derivation, CMAC
+    "C": 4,   # TR-31:2010, TDES Variant, CBC-MAC
+    "D": 16,  # X9.143 / ISO 20038, AES Derivation, CMAC
+    "E": 16,  # ISO 20038:2017, AES Derivation, CMAC (CTR)
+}
+
+
+class TR31OptionalBlock(FieldSet):
+    """One optional block: ID (2) + Len (2 hex) + Data.
+
+    ``Len`` is two hex characters giving the *total* block length (in
+    characters, i.e. bytes of ASCII), including the ID and length fields.
+    A length field of ``00`` selects the extended form: the next two
+    characters give the byte-count of a following hex length value.
+    """
+
+    def _peek(self, char_offset: int, count: int) -> str:
+        bit_pos = self.absolute_address + self.current_size + char_offset * 8
+        return self.stream.readBytes(bit_pos, count).decode("ascii", "replace")
+
+    def createFields(self) -> GeneratorType:
+        yield String(self, "id", 2, charset="ASCII")
+
+        len_field = self._peek(0, 2)
+        if len_field == "00":
+            yield String(self, "length", 2, charset="ASCII")
+            num = int(self._peek(0, 2), 16)
+            yield ComputedBytes(
+                self, "length_ext", 2, value=num, description="Extended length size"
+            )
+            total = int(self._peek(0, num), 16)
+            yield String(self, "length_value", num, charset="ASCII")
+            data_len = total - 4 - num
+        else:
+            total = int(len_field, 16)
+            yield ComputedBytes(
+                self, "length", 2, value=total, description="Block length"
+            )
+            data_len = total - 4
+
+        if data_len > 0:
+            yield String(self, "data", data_len, charset="ASCII")
+
+
+class TR31KeyBlock(Parser):
+    """TR-31 / X9.143 key block — ASCII header, optional blocks, hex payload."""
+
+    endian = BIG_ENDIAN
+
+    def _peek(self, char_offset: int, count: int) -> str:
+        bit_pos = self.absolute_address + self.current_size + char_offset * 8
+        return self.stream.readBytes(bit_pos, count).decode("ascii", "replace")
+
+    def createFields(self) -> GeneratorType:
+        version_id = self._peek(0, 1)
+        total_len = int(self._peek(1, 4))
+        opt_count = int(self._peek(12, 2))
+
+        yield String(self, "version_id", 1, charset="ASCII")
+        yield String(self, "length", 4, charset="ASCII")
+        yield String(self, "key_usage", 2, charset="ASCII")
+        yield String(self, "algorithm", 1, charset="ASCII")
+        yield String(self, "mode_of_use", 1, charset="ASCII")
+        yield String(self, "key_version", 2, charset="ASCII")
+        yield String(self, "exportability", 1, charset="ASCII")
+        yield String(self, "opt_blocks_count", 2, charset="ASCII")
+        yield String(self, "key_context", 1, charset="ASCII")
+        yield String(self, "reserved", 1, charset="ASCII")
+
+        for _ in range(opt_count):
+            yield TR31OptionalBlock(self, "opt_block[]")
+
+        header_and_opts = self.current_size // 8
+        mac_bytes = _TR31_MAC_BYTES.get(version_id, 8)
+        mac_chars = mac_bytes * 2
+        payload_chars = total_len - header_and_opts - mac_chars
+
+        if payload_chars > 0:
+            yield String(self, "payload", payload_chars, charset="ASCII")
+        if mac_chars > 0:
+            yield String(self, "authenticator", mac_chars, charset="ASCII")
+
+
 PARSERS: dict[str, type[Parser]] = {
     "asn1tlv":  ASN1TLVParser,
     "asn1": asn1.ASN1File,
     "elf": elf.ElfFile,
+    "tr31": TR31KeyBlock,
 }
 
 FIELDS: dict[str, type[Field]] = {

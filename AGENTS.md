@@ -1,5 +1,18 @@
 # AGENTS.md — binparser Development Notes
 
+## Best Learning How to Use Hachoir
+
+The best way to learn hachoir is from its **existing parsers**.  Locate the
+source directory first:
+
+```bash
+uv run --with hachoir python3 -c "import hachoir.parser ; print(hachoir.parser.__path__)"
+```
+
+Then browse the parsers (e.g. `png.py`, `gif.py`, `elf.py`) to see real-world
+usage patterns — field definitions, `createFields()`, endian handling, and
+conditional parsing.
+
 ## Toolchain: `uv run --script`
 
 The main entry point `binparser` is a **PEP 723 inline-script** (the `/// script`
@@ -28,41 +41,7 @@ memory**.  Confirm the behaviour before touching `binparser`.
 
 This avoids the cycle of: edit the main file → run → error → edit again.
 
-### Example: Discovering That `readBytes` Addresses Are in Bits
-
-ASN.1 parsing requires peeking at the leading byte to determine how many bytes
-the tag and length fields occupy.  Hachoir's `createFields()` is a generator;
-calling `self.stream.readBytes()` inside it does **not** advance the parser's
-position tracker — it is a non-destructive peek.
-
-However, the initial code `readBytes(byte_pos, 1)` passed a byte offset where
-hachoir expected a bit address, causing the internal error
-`"TODO: handle non-byte-aligned data"` and triggering an autofix that swallowed
-the entire TLV as raw bytes.
-
-The following isolated experiment revealed the correct address unit:
-
-```bash
-uv run --with hachoir python -c "
-from hachoir.stream import StringInputStream
-s = StringInputStream(b'Hello')
-print(s.readBytes(0, 1))   # b'H'   ← bit 0
-print(s.readBytes(8, 1))   # b'e'   ← bit 8 = byte 1
-print(s.readBytes(1, 1))   # error  ← bit 1 is not byte-aligned
-"
-```
-
-Conclusion: `readBytes(address, count)` expects `address` in **bits**.
-Therefore the correct peek pattern is:
-
-```python
-bit_pos = self.absolute_address + self.current_size  # already in bits
-tag0 = self.stream.readBytes(bit_pos, 1)[0]
-```
-
-Only after confirming this did the peek logic go into `ASN1TLV.createFields()`.
-
-### Another Example: `is_field_set` vs `isinstance`
+### Example: `is_field_set` vs `isinstance`
 
 `_extract_fields` originally used `isinstance(field, (UInt32, UInt16, UInt8,
 RawBytes))` to distinguish containers from leaf nodes — every new field type
@@ -98,4 +77,173 @@ test/
   gen_demoB.py      # generates test data for the demoB struct
   gen_asn1.py       # generates ASN.1 BER/DER test data
 test.sh             # quick regression suite
+```
+
+---
+
+## Common Hachoir Patterns
+
+### Field Types (from `hachoir.field`)
+
+```python
+from hachoir.field import (
+    # Integers
+    UInt8, UInt16, UInt32, UInt64,
+
+    # Strings
+    String,          # Fixed-length:  String(self, "name", length, "Desc", charset="ASCII")
+    CString,         # Null-terminated: CString(self, "name", "Desc", charset="ISO-8859-1")
+    PascalString8,   # Length-prefixed (8-bit len)
+    PascalString16,  # Length-prefixed (16-bit len)
+
+    # Bits / Bytes
+    Bit,             # Single bit:   Bit(self, "flag")
+    Bits,            # Multi-bit:    Bits(self, "field", 3)
+    Bytes,           # Fixed bytes:  Bytes(self, "id", 8, "Magic")
+    RawBytes,        # Opaque dump:  RawBytes(self, "data", size)
+
+    # Padding
+    NullBits,        # NullBits(self, "reserved", 5)
+    NullBytes,       # NullBytes(self, "padding", 1)
+    PaddingBits, PaddingBytes,
+
+    # Containers
+    FieldSet,        # Reusable group of fields
+    Parser,          # Root parser (aka HachoirParser)
+
+    # Wrappers
+    Enum,            # Enum(UInt8(self, "type"), {0: "none", 1: "meter"})
+    SubFile,         # Encapsulate embedded data segment
+    CompressedField, # Decompress inline
+
+    # Misc
+    TimeDateMSDOS32, # DOS timestamp
+    ParserError,     # raise ParserError("reason")
+)
+```
+
+### Enum Pattern — the Most Common Wrapper
+
+Every parser uses `Enum` to map integer codes to human-readable labels. Works
+with any integer type: `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Bits`.
+
+```python
+COMPRESSION_METHOD = {
+    0: "no compression",
+    8: "Deflate",
+    9: "Deflate64",
+}
+yield Enum(UInt16(self, "compression"), COMPRESSION_METHOD)
+
+# Also works with Bits:
+yield Enum(Bits(self, "table_class", 4), {0: "DC", 1: "AC"})
+```
+
+### textHandler — Display Integer as Hex
+
+```python
+from hachoir.core.text_handler import textHandler, hexadecimal
+yield textHandler(UInt32(self, "crc32"), hexadecimal)
+```
+
+### FieldSet — the Reusable Block Pattern
+
+```python
+class MyChunk(FieldSet):
+    def createFields(self):
+        yield UInt32(self, "size")
+        yield String(self, "tag", 4, charset="ASCII")
+        if self["size"].value:
+            yield RawBytes(self, "data", self["size"].value)
+
+    def createDescription(self):           # optional human-readable summary
+        return "Chunk: %s" % self["tag"].display
+```
+
+### Parser — the Root Parser
+
+```python
+from hachoir.parser import Parser
+from hachoir.core.endian import LITTLE_ENDIAN
+
+class MyFile(Parser):
+    endian = LITTLE_ENDIAN
+    PARSER_TAGS = {
+        "id": "myformat",
+        "category": "misc",
+        "file_ext": ("ext",),
+        "mime": ("application/x-myformat",),
+        "magic": ((b"\x89MAGIC", 0),),
+        "min_size": 16 * 8,              # in bits!
+        "description": "My file format",
+    }
+
+    def validate(self):
+        # Return True if valid, or error string
+        if self.stream.readBytes(0, 4) != b"MAGI":
+            return "Invalid magic"
+        return True
+
+    def createFields(self):
+        while not self.eof:
+            yield MyChunk(self, "chunk[]")   # [] suffix = array index
+
+    def createDescription(self):
+        return "MyFile: %d chunks" % (len(self.array("chunk")))
+```
+
+### Conditional Parsing — Gate on Field Value
+
+```python
+if self["has_local_map"].value:
+    nb_color = 1 << (1 + self["size_local_map"].value)
+    yield PaletteRGB(self, "local_map", nb_color)
+```
+
+### Looping with Array Indices — the `[]` Convention
+
+```python
+# Fixed number of items:
+for i in range(nb_color):
+    yield RGB(self, "color[]")           # becomes color[0], color[1], ...
+
+# Until EOF or sentinel:
+while not self.eof:
+    yield Chunk(self, "chunk[]")         # becomes chunk[0], chunk[1], ...
+```
+
+### Size Arithmetic — Everything Is in Bits
+
+```python
+# FieldSet has:
+self.size            # total expected size in bits
+self.current_size    # bytes yielded so far (bits)
+self.eof             # .current_size >= .size
+
+# Child field size in bits:
+self["header"].size // 8     # size in bytes
+self["data"].value           # .value for integers
+
+# Assign _size explicitly (in bits) when known ahead:
+self._size = (size_bytes + 3 * 4) * 8
+```
+
+### Peeking the Stream (Non-Advancing)
+
+```python
+# readBytes(address_in_bits, count_in_bytes)
+first_byte = self.stream.readBytes(self.absolute_address, 1)[0]
+
+# readBits(address_in_bits, count_in_bits, endian)
+header = self.stream.readBits(addr, 32, self.endian)
+```
+
+### Error Handling & Early Exit
+
+```python
+raise ParserError("Invalid chunk: expected 0x01, got 0x%02X" % val)
+
+# Early return from createFields() generator:
+if self["size"].value == 0:
+    return
 ```

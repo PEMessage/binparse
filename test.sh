@@ -28,4 +28,8 @@ echo "=== 6. asn1 --show-trailing ==="
 "$SCRIPT_DIR/test/gen_demoA.py" -n 1 | uv run --script "$PARSER" -s asn1tlv show --show-trailing -c none | tail -3
 
 echo ""
+echo "=== 7. tr31 ==="
+"$SCRIPT_DIR/test/gen_tr31.py" | uv run --script "$PARSER" -s tr31 show -c none
+
+echo ""
 echo "=== All tests passed ==="
