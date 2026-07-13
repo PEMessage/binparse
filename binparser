@@ -37,11 +37,12 @@ import sys
 import termios
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum as StdEnum
 from functools import cache
 
 from hachoir.core.endian import BIG_ENDIAN, LITTLE_ENDIAN
 from hachoir.core.log import log as _hachoir_log
+from hachoir.field import Enum
 from hachoir.field import Field, FieldSet, RawBytes, String, UInt8, UInt16, UInt32
 from hachoir.parser import Parser
 from hachoir.stream import StringInputStream
@@ -176,6 +177,8 @@ class ASN1TLVParser(Parser):
 
 
 # --- Fourth parser: TR-31 / X9.143 key block (ASCII header + hex payload) ---
+# Enum meanings from ANSI X9.143:2021 (via github.com/openemv/tr31 tr31.h /
+# tr31_strings.c).  Keys are the raw ASCII values as they appear in the header.
 
 
 # Authenticator length in bytes, keyed by the leading version_id character.
@@ -185,6 +188,124 @@ _TR31_MAC_BYTES: dict[str, int] = {
     "C": 4,   # TR-31:2010, TDES Variant, CBC-MAC
     "D": 16,  # X9.143 / ISO 20038, AES Derivation, CMAC
     "E": 16,  # ISO 20038:2017, AES Derivation, CMAC (CTR)
+}
+
+# See ANSI X9.143:2021, 6.2 / ISO 20038:2017
+TR31_VERSION_ID = {
+    "A": "TR-31:2005 / X9.143 (TDES Key Variant Binding)",
+    "B": "TR-31:2010 / X9.143 (TDES Key Derivation Binding)",
+    "C": "TR-31:2010 / X9.143 (TDES Key Variant Binding)",
+    "D": "X9.143 / ISO 20038 (AES Key Derivation Binding)",
+    "E": "ISO 20038:2017 (AES Key Derivation Binding)",
+}
+
+# See ANSI X9.143:2021, 6.3.1, table 2
+TR31_KEY_USAGE = {
+    "B0": "Base Derivation Key (BDK)",
+    "B1": "Initial DUKPT Key (IK/IPEK)",
+    "B2": "Base Key Variant Key",
+    "B3": "Key Derivation Key",
+    "C0": "Card Verification Key (CVK)",
+    "D0": "Symmetric Key for Data Encryption",
+    "D1": "Asymmetric Key for Data Encryption",
+    "D2": "Data Encryption Key for Decimalization Table",
+    "D3": "Data Encryption Key for Sensitive Data",
+    "E0": "EMV/Chip Issuer Master Key: Application Cryptograms (MKAC)",
+    "E1": "EMV/Chip Issuer Master Key: Secure Messaging for Confidentiality (MKSMC)",
+    "E2": "EMV/Chip Issuer Master Key: Secure Messaging for Integrity (MKSMI)",
+    "E3": "EMV/Chip Issuer Master Key: Data Authentication Code (MKDAC)",
+    "E4": "EMV/Chip Issuer Master Key: Dynamic Numbers (MKDN)",
+    "E5": "EMV/Chip Issuer Master Key: Card Personalization (CP)",
+    "E6": "EMV/Chip Issuer Master Key: Other",
+    "E7": "EMV/Chip Asymmetric Key Pair for PIN Encryption",
+    "I0": "Initialization Vector (IV)",
+    "K0": "Key Encryption or Wrapping Key (KEK)",
+    "K1": "ANSI X9.143 / TR-31 Key Block Protection Key (KBPK)",
+    "K2": "ANSI X9.139 / TR-34 Asymmetric Key Pair for Key Receiving Device",
+    "K3": "Asymmetric Key Pair for Key Wrapping or Key Agreement",
+    "K4": "ISO 20038 Key Block Protection Key (KBPK)",
+    "M0": "ISO 16609 MAC algorithm 1 (using TDES)",
+    "M1": "ISO 9797-1 MAC Algorithm 1 (CBC-MAC)",
+    "M2": "ISO 9797-1 MAC Algorithm 2",
+    "M3": "ISO 9797-1 MAC Algorithm 3 (Retail MAC)",
+    "M4": "ISO 9797-1 MAC Algorithm 4",
+    "M5": "ISO 9797-1:1999 MAC Algorithm 5 (legacy)",
+    "M6": "ISO 9797-1:2011 MAC Algorithm 5 (CMAC)",
+    "M7": "HMAC Key",
+    "M8": "ISO 9797-1 MAC Algorithm 6",
+    "P0": "PIN Encryption Key",
+    "P1": "PIN Generation Key",
+    "S0": "Asymmetric Key Pair for Digital Signature",
+    "S1": "Asymmetric Key Pair for CA use",
+    "S2": "Asymmetric Key Pair for non-X9.24 use",
+    "V0": "PIN Verification Key (Other)",
+    "V1": "PIN Verification Key (IBM 3624)",
+    "V2": "PIN Verification Key (VISA PVV)",
+    "V3": "PIN Verification Key (ANSI X9.132 algorithm 1)",
+    "V4": "PIN Verification Key (ANSI X9.132 algorithm 2)",
+    "V5": "PIN Verification Key (ANSI X9.132 algorithm 3)",
+}
+
+# See ANSI X9.143:2021, 6.3.2, table 3 / ISO 20038:2017, Annex A.2.4
+TR31_ALGORITHM = {
+    "A": "AES",
+    "D": "DES",
+    "E": "Elliptic Curve",
+    "H": "HMAC (X9.143) / HMAC-SHA-1 (ISO 20038)",
+    "I": "HMAC-SHA-2 (ISO 20038)",
+    "J": "HMAC-SHA-3 (ISO 20038)",
+    "R": "RSA",
+    "S": "DSA",
+    "T": "TDES",
+}
+
+# See ANSI X9.143:2021, 6.3.3, table 4
+TR31_MODE_OF_USE = {
+    "B": "Encrypt/Wrap and Decrypt/Unwrap",
+    "C": "MAC Generate and Verify",
+    "D": "Decrypt/Unwrap Only",
+    "E": "Encrypt/Wrap Only",
+    "G": "MAC Generate Only",
+    "N": "No special restrictions",
+    "S": "Signature Only",
+    "V": "MAC Verify Only",
+    "X": "Key Derivation",
+    "Y": "Create Key Variants",
+}
+
+# See ANSI X9.143:2021, 6.3.5, table 6
+TR31_EXPORTABILITY = {
+    "E": "Exportable in a trusted key block only",
+    "N": "Not exportable",
+    "S": "Sensitive",
+}
+
+# See ANSI X9.143:2021, 6.2, table 1
+TR31_KEY_CONTEXT = {
+    "0": "Determined by wrapping key",
+    "1": "Storage context only",
+    "2": "Key exchange context only",
+}
+
+# See ANSI X9.143:2021, 6.3.6, table 7
+TR31_OPT_BLOCK_ID = {
+    "AL": "Asymmetric Key Life (AKL)",
+    "BI": "Base Derivation Key (BDK) Identifier",
+    "CT": "Public Key Certificate",
+    "DA": "Derivation(s) Allowed for Derivation Keys",
+    "FL": "Flags",
+    "HM": "Hash algorithm for HMAC",
+    "IK": "Initial Key Identifier (IKID)",
+    "KC": "Key Check Value (KCV) of wrapped key",
+    "KP": "Key Check Value (KCV) of KBPK",
+    "KS": "Initial Key Serial Number (KSN)",
+    "KV": "Key Block Values",
+    "LB": "Label",
+    "PB": "Padding Block",
+    "PK": "Protection Key Check Value (KCV) of export KBPK",
+    "TC": "Time of Creation",
+    "TS": "Time Stamp",
+    "WP": "Wrapping Pedigree",
 }
 
 
@@ -202,7 +323,7 @@ class TR31OptionalBlock(FieldSet):
         return self.stream.readBytes(bit_pos, count).decode("ascii", "replace")
 
     def createFields(self) -> GeneratorType:
-        yield String(self, "id", 2, charset="ASCII")
+        yield Enum(String(self, "id", 2, charset="ASCII"), TR31_OPT_BLOCK_ID)
 
         len_field = self._peek(0, 2)
         if len_field == "00":
@@ -239,15 +360,15 @@ class TR31KeyBlock(Parser):
         total_len = int(self._peek(1, 4))
         opt_count = int(self._peek(12, 2))
 
-        yield String(self, "version_id", 1, charset="ASCII")
+        yield Enum(String(self, "version_id", 1, charset="ASCII"), TR31_VERSION_ID)
         yield String(self, "length", 4, charset="ASCII")
-        yield String(self, "key_usage", 2, charset="ASCII")
-        yield String(self, "algorithm", 1, charset="ASCII")
-        yield String(self, "mode_of_use", 1, charset="ASCII")
+        yield Enum(String(self, "key_usage", 2, charset="ASCII"), TR31_KEY_USAGE)
+        yield Enum(String(self, "algorithm", 1, charset="ASCII"), TR31_ALGORITHM)
+        yield Enum(String(self, "mode_of_use", 1, charset="ASCII"), TR31_MODE_OF_USE)
         yield String(self, "key_version", 2, charset="ASCII")
-        yield String(self, "exportability", 1, charset="ASCII")
+        yield Enum(String(self, "exportability", 1, charset="ASCII"), TR31_EXPORTABILITY)
         yield String(self, "opt_blocks_count", 2, charset="ASCII")
-        yield String(self, "key_context", 1, charset="ASCII")
+        yield Enum(String(self, "key_context", 1, charset="ASCII"), TR31_KEY_CONTEXT)
         yield String(self, "reserved", 1, charset="ASCII")
 
         for _ in range(opt_count):
@@ -319,7 +440,7 @@ class FieldSpan:
     end_byte: int  # exclusive
 
 
-class ColorMode(Enum):
+class ColorMode(StdEnum):
     ALL = "all"
     FG = "fg"
     BG = "bg"
