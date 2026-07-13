@@ -346,20 +346,12 @@ class TR31OptionalBlock(FieldSet):
             yield String(self, "data", data_len, charset="ASCII")
 
 
-class TR31KeyBlock(Parser):
-    """TR-31 / X9.143 key block — ASCII header, optional blocks, hex payload."""
+class TR31Header(FieldSet):
+    """TR-31 / X9.143 header (16 ASCII chars) followed by optional blocks."""
 
     endian = BIG_ENDIAN
 
-    def _peek(self, char_offset: int, count: int) -> str:
-        bit_pos = self.absolute_address + self.current_size + char_offset * 8
-        return self.stream.readBytes(bit_pos, count).decode("ascii", "replace")
-
     def createFields(self) -> GeneratorType:
-        version_id = self._peek(0, 1)
-        total_len = int(self._peek(1, 4))
-        opt_count = int(self._peek(12, 2))
-
         yield Enum(String(self, "version_id", 1, charset="ASCII"), TR31_VERSION_ID)
         yield String(self, "length", 4, charset="ASCII")
         yield Enum(String(self, "key_usage", 2, charset="ASCII"), TR31_KEY_USAGE)
@@ -371,10 +363,23 @@ class TR31KeyBlock(Parser):
         yield Enum(String(self, "key_context", 1, charset="ASCII"), TR31_KEY_CONTEXT)
         yield String(self, "reserved", 1, charset="ASCII")
 
+        opt_count = int(self["opt_blocks_count"].value)
         for _ in range(opt_count):
             yield TR31OptionalBlock(self, "opt_block[]")
 
-        header_and_opts = self.current_size // 8
+
+class TR31KeyBlock(FieldSet):
+    """TR-31 / X9.143 key block — header + optional blocks, hex payload, authenticator."""
+
+    endian = BIG_ENDIAN
+
+    def createFields(self) -> GeneratorType:
+        yield TR31Header(self, "header")
+
+        version_id = self["header"]["version_id"].value
+        total_len = int(self["header"]["length"].value)
+
+        header_and_opts = self["header"].size // 8
         mac_bytes = _TR31_MAC_BYTES.get(version_id, 8)
         mac_chars = mac_bytes * 2
         payload_chars = total_len - header_and_opts - mac_chars
@@ -389,12 +394,13 @@ PARSERS: dict[str, type[Parser]] = {
     "asn1tlv":  ASN1TLVParser,
     "asn1": asn1.ASN1File,
     "elf": elf.ElfFile,
-    "tr31": TR31KeyBlock,
 }
 
 FIELDS: dict[str, type[Field]] = {
     "demoA": DemoA,
     "demoB": DemoB,
+    "tr31header": TR31Header,
+    "tr31": TR31KeyBlock,
 }
 
 
